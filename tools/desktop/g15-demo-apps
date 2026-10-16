@@ -1,0 +1,9 @@
+#!/bin/sh
+# Open the G15 demo apps in the current Hyprland session: the triangle
+# (weston-simple-egl) and the textured crate (glmark2 texture scene).
+# Add --cpu to run the same apps on the CPU renderer for comparison.
+run=""
+[ "${1:-}" = --cpu ] && run=/usr/local/bin/sw
+setsid $run weston-simple-egl >/dev/null 2>&1 &
+setsid $run glmark2-es2-wayland -b texture:texture-filter=linear --run-forever >/dev/null 2>&1 &
+echo "Opened the triangle and the crate${run:+ on the CPU renderer}. Close them with: pkill -f weston-simple-egl; pkill -f glmark2-es2-wayland"

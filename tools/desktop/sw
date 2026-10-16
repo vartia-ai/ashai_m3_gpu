@@ -1,0 +1,6 @@
+#!/bin/sh
+# Run one app on the CPU renderer (system Mesa, llvmpipe) inside the G15
+# desktop, for comparison:  sw glmark2-es2-wayland
+exec env -u LD_LIBRARY_PATH -u GBM_BACKENDS_PATH -u __EGL_VENDOR_LIBRARY_FILENAMES \
+    -u ASAHI_G15_GRAPHICS LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+    MESA_LOADER_DRIVER_OVERRIDE=kms_swrast "$@"

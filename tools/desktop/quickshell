@@ -1,0 +1,5 @@
+#!/bin/sh
+# m3gpu: Omarchy's shell (Qt Quick) uses render-target formats the G15 Mesa
+# does not support yet; in the G15 session run it on the CPU renderer (sw).
+if [ -n "${ASAHI_G15_GRAPHICS:-}" ]; then exec /usr/local/bin/sw /usr/bin/quickshell "$@"; fi
+exec /usr/bin/quickshell "$@"

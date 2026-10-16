@@ -1,0 +1,5 @@
+#!/bin/sh
+# m3gpu: ghostty needs desktop OpenGL 3.3, which the G15 driver does not
+# provide yet; in the G15 session run it on the CPU renderer (sw).
+if [ -n "${ASAHI_G15_GRAPHICS:-}" ]; then exec /usr/local/bin/sw /usr/bin/ghostty "$@"; fi
+exec /usr/bin/ghostty "$@"

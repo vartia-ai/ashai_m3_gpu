@@ -1,0 +1,3952 @@
+diff --git a/include/drm-uapi/asahi_drm.h b/include/drm-uapi/asahi_drm.h
+index b1d6d35..9cf9660 100644
+--- a/include/drm-uapi/asahi_drm.h
++++ b/include/drm-uapi/asahi_drm.h
+@@ -191,6 +191,22 @@ struct drm_asahi_params_global {
+ 	 * seconds, rather than hardcoding a particular firmware's rate.
+ 	 */
+ 	__u64 command_timestamp_frequency_hz;
++
++	/**
++	 * @usc_window_start: Extra VM_BIND window for USC code, entries and
++	 * tables, or 0. G15 fetches use a fixed 1-TiB base plus a 32-bit offset
++	 * regardless of queue usc_exec_base; this window is outside vm_start/end.
++	 */
++	__u64 usc_window_start;
++
++	/** @usc_window_end: End (exclusive) of the USC window, or 0. */
++	__u64 usc_window_end;
++
++	/** @render_context_start: G15 user VDM/PPP window start, or 0. */
++	__u64 render_context_start;
++
++	/** @render_context_end: End (exclusive) of the VDM/PPP window, or 0. */
++	__u64 render_context_end;
+ };
+ 
+ /**
+@@ -807,6 +823,12 @@ enum drm_asahi_render_flags {
+ 	 */
+ 	DRM_ASAHI_RENDER_VDM_BARRIER_FRAGMENT = (1U << 3),
+ 
++	/*
++	 * J613 G15 (private): the render may give a tile list past byte 0x40
++	 * of a 128-byte chunk; the kernel serializes TA->3D and relinks it.
++	 */
++	DRM_ASAHI_RENDER_G15_LONG_LISTS = (1U << 27),
++
+ 	/**
+ 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.
+ 	 *
+diff --git a/src/asahi/compiler/agx_compile.h b/src/asahi/compiler/agx_compile.h
+index d852ee1..66744f6 100644
+--- a/src/asahi/compiler/agx_compile.h
++++ b/src/asahi/compiler/agx_compile.h
+@@ -167,6 +167,7 @@ struct agx_shader_info {
+    uint32_t apple9_texture_mask, apple9_sampler_mask, apple9_image_mask;
+    bool apple9_uses_texel_fetch;
+    bool apple9_uses_discard;
++   bool apple9_actual_discard;
+ 
+    union agx_varyings varyings;
+ 
+diff --git a/src/asahi/compiler/agx_compile_apple9.c b/src/asahi/compiler/agx_compile_apple9.c
+index a6a9c0b..efcfe8c 100644
+--- a/src/asahi/compiler/agx_compile_apple9.c
++++ b/src/asahi/compiler/agx_compile_apple9.c
+@@ -1494,6 +1494,22 @@ apple9_varying_index(const struct agx_apple9_varying_layout *layout,
+    return index;
+ }
+ 
++static uint32_t
++apple9_center_perspective_reciprocal(struct apple9_dag_lower *lower)
++{
++   if (!lower->perspective_ready) {
++      uint32_t denominator = apple9_dag_emit(
++         lower, AGX_APPLE9_VIR_ITER, AGX_APPLE9_ENC_ITER, NULL, 0, 0);
++      uint32_t reciprocal = apple9_dag_emit(lower, AGX_APPLE9_VIR_FRCP,
++         AGX_APPLE9_ENC_FLOAT_SPECIAL, &denominator, 1, 3);
++      if (reciprocal == AGX_APPLE9_VREG_INVALID)
++         return reciprocal;
++      lower->perspective_reciprocal = reciprocal;
++      lower->perspective_ready = true;
++   }
++   return lower->perspective_reciprocal;
++}
++
+ static uint32_t
+ apple9_lower_interpolated_input(struct apple9_dag_lower *lower,
+                                 nir_scalar scalar)
+@@ -1546,18 +1562,13 @@ apple9_lower_interpolated_input(struct apple9_dag_lower *lower,
+                              at_position ? &position : NULL, at_position, index + 1);
+    }
+    uint32_t reciprocal;
+-   if (at_position || !lower->perspective_ready) {
++   if (at_position) {
+       uint32_t denominator = apple9_dag_emit(
+-         lower, AGX_APPLE9_VIR_ITER, encoding,
+-         at_position ? &position : NULL, at_position, 0);
++         lower, AGX_APPLE9_VIR_ITER, encoding, &position, 1, 0);
+       reciprocal = apple9_dag_emit(lower, AGX_APPLE9_VIR_FRCP,
+          AGX_APPLE9_ENC_FLOAT_SPECIAL, &denominator, 1, 3);
+-      if (!at_position) {
+-         lower->perspective_reciprocal = reciprocal;
+-         lower->perspective_ready = true;
+-      }
+    } else {
+-      reciprocal = lower->perspective_reciprocal;
++      reciprocal = apple9_center_perspective_reciprocal(lower);
+    }
+    uint32_t coefficient = apple9_dag_emit(
+       lower, AGX_APPLE9_VIR_ITER, encoding,
+@@ -4438,6 +4449,31 @@ apple9_compile_dag_body(nir_shader *nir, struct agx_shader_part *out,
+          }
+       }
+    }
++   /* The center-perspective reciprocal is shared by all smooth inputs.
++    * Its first demand can be in one branch and a later demand in the merge.
++    * Define the cached value in the entry prologue, as with system values. */
++   if (lower.structured_cf && nir->info.stage == MESA_SHADER_FRAGMENT) {
++      bool needs_center_perspective = false;
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_load_interpolated_input)
++               continue;
++            nir_intrinsic_instr *bary = nir_src_as_intrinsic(intr->src[0]);
++            needs_center_perspective |= bary &&
++               bary->intrinsic == nir_intrinsic_load_barycentric_pixel &&
++               (nir_intrinsic_interp_mode(bary) == INTERP_MODE_SMOOTH ||
++                nir_intrinsic_interp_mode(bary) == INTERP_MODE_NONE);
++         }
++      }
++      if (needs_center_perspective &&
++          apple9_center_perspective_reciprocal(&lower) == AGX_APPLE9_VREG_INVALID) {
++         *reason = "could not initialize Apple9 perspective interpolation";
++         goto fail;
++      }
++   }
+    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+        BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_FRONT_FACE) &&
+        apple9_dag_system(&lower, (struct apple9_system_source){.selector = 0xc5}) ==
+@@ -4762,6 +4798,8 @@ apple9_compile_dag_body(nir_shader *nir, struct agx_shader_part *out,
+    out->info.apple9_reads_primitive_id = lower.reads_primitive_id;
+    out->info.depth_layout = lower.writes_z ? FRAG_DEPTH_LAYOUT_ANY
+                                           : FRAG_DEPTH_LAYOUT_UNCHANGED;
++   out->info.early_fragment_tests = nir->info.stage == MESA_SHADER_FRAGMENT &&
++                                     nir->info.fs.early_fragment_tests;
+    out->info.apple9_reads_point_coord = lower.reads_point_coord;
+    out->info.apple9_writes_point_size = nir->info.stage == MESA_SHADER_VERTEX &&
+       (nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ));
+@@ -5313,6 +5351,23 @@ apple9_lower_rectangle(nir_builder *b, nir_instr *instr, UNUSED void *data)
+    return true;
+ }
+ 
++/* The state tracker expands external YUV sampling before driver compilation.
++ * Each remaining external sample is an ordinary normalized 2D plane fetch. */
++static bool
++apple9_lower_external_sampler(UNUSED nir_builder *b, nir_instr *instr,
++                              UNUSED void *data)
++{
++   if (instr->type != nir_instr_type_tex)
++      return false;
++
++   nir_tex_instr *tex = nir_instr_as_tex(instr);
++   if (tex->sampler_dim != GLSL_SAMPLER_DIM_EXTERNAL)
++      return false;
++
++   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
++   return true;
++}
++
+ /* LOD queries use the texture unit's derivative and clamp machinery. The
+  * hardware returns continuous LODs; GL additionally applies mip selection to
+  * the first component. Bias goes through the normal sample-bias operand. */
+@@ -5368,6 +5423,8 @@ agx_nir_lower_apple9_sampler_state(
+    } while (optimized);
+    nir_lower_samplers(nir);
+    nir_opt_constant_folding(nir);
++   nir_shader_instructions_pass(nir, apple9_lower_external_sampler,
++                                nir_metadata_control_flow, NULL);
+    nir_shader_instructions_pass(nir, apple9_lower_rectangle,
+                                 nir_metadata_control_flow, NULL);
+    const nir_lower_tex_options options = {
+@@ -6682,6 +6739,10 @@ apple9_compile_graphics(nir_shader *nir, struct agx_shader_part *out,
+    if (!reason)
+       reason = &unused_reason;
+    memset(out, 0, sizeof(*out));
++   bool uses_discard = nir->info.stage == MESA_SHADER_FRAGMENT &&
++                       nir->info.fs.uses_discard;
++   bool writes_sample_mask = nir->info.stage == MESA_SHADER_FRAGMENT &&
++      (nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK));
+    if (reason)
+       *reason = NULL;
+    /* Legacy gl_FragColor broadcasts to each enabled draw buffer. */
+@@ -6753,8 +6814,13 @@ apple9_compile_graphics(nir_shader *nir, struct agx_shader_part *out,
+    /* Use the same structured mask/loop model as compute. Continuations become
+     * masked regions with one backedge before instruction selection. */
+    nir_lower_continue_constructs(nir);
+-   if (nir->info.stage == MESA_SHADER_FRAGMENT)
++   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
++      if (nir->info.fs.early_fragment_tests) {
++         agx_nir_lower_discard_zs_emit(nir);
++         nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++      }
+       apple9_collect_color(nir);
++   }
+    /* As on Apple8, promote direct accesses to SSA, keep small arrays in
+     * registers, and lower larger dynamically indexed arrays to scratch. */
+    nir_lower_array_deref_of_vec(nir, nir_var_function_temp, NULL,
+@@ -6922,7 +6988,11 @@ apple9_compile_graphics(nir_shader *nir, struct agx_shader_part *out,
+       nir_shader_intrinsics_pass(nir, apple9_lower_clip_distance,
+                                  nir_metadata_control_flow, (void *)&state);
+    }
+-   return apple9_compile_dag(nir, out, NULL, &varyings, reason);
++   if (!apple9_compile_dag(nir, out, NULL, &varyings, reason))
++      return false;
++   out->info.apple9_actual_discard = uses_discard || writes_sample_mask ||
++                                    (blend && blend[0].disabled_samples);
++   return true;
+ }
+ 
+ bool
+diff --git a/src/asahi/compiler/meson.build b/src/asahi/compiler/meson.build
+index f9b3e50..43e61d7 100644
+--- a/src/asahi/compiler/meson.build
++++ b/src/asahi/compiler/meson.build
+@@ -109,6 +109,42 @@ libasahi_compiler = static_library(
+ )
+ 
+ if with_tests or with_tools.contains('drm-shim')
++  executable(
++    'agx_apple9_fs_progress_fixture',
++    files('test/apple9-fs-progress-fixture.c'),
++    c_args : [no_override_init_args],
++    gnu_symbol_visibility : 'hidden',
++    dependencies : [idep_nir, idep_mesautil],
++    link_with : [libasahi_compiler],
++  )
++
++  executable(
++    'agx_apple9_depth_fixtures',
++    files('test/apple9-depth-fixtures.c'),
++    c_args : [no_override_init_args],
++    gnu_symbol_visibility : 'hidden',
++    dependencies : [idep_nir, idep_mesautil],
++    link_with : [libasahi_compiler],
++  )
++
++  executable(
++    'agx_apple9_runtime_fixtures',
++    files('test/apple9-runtime-fixtures.c'),
++    c_args : [no_override_init_args],
++    gnu_symbol_visibility : 'hidden',
++    dependencies : [idep_nir, idep_mesautil],
++    link_with : [libasahi_compiler],
++  )
++
++  executable(
++    'agx_apple9_write1337',
++    files('test/apple9-write1337.c'),
++    c_args : [no_override_init_args],
++    gnu_symbol_visibility : 'hidden',
++    dependencies : [idep_nir, idep_mesautil],
++    link_with : [libasahi_compiler],
++  )
++
+   executable(
+     'agx_apple9_tiny_tool',
+     files('test/apple9-tiny-tool.c'),
+diff --git a/src/asahi/compiler/test/apple9-depth-fixtures.c b/src/asahi/compiler/test/apple9-depth-fixtures.c
+new file mode 100644
+index 0000000..645edcd
+--- /dev/null
++++ b/src/asahi/compiler/test/apple9-depth-fixtures.c
+@@ -0,0 +1,112 @@
++/* SPDX-License-Identifier: MIT */
++#include "agx_compile_apple9.h"
++#include "compiler/nir/nir_builder.h"
++#include "gallium/drivers/asahi/agx_apple9.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static bool
++write_case(const char *directory, const char *name, bool early, bool exports,
++           bool discard)
++{
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &agx_nir_options, "depth_fixture_%s", name);
++   b.shader->info.fs.early_fragment_tests = early;
++   b.shader->info.io_lowered = true;
++   if (discard)
++      nir_demote(&b);
++   nir_store_output(&b, nir_imm_vec4(&b, early ? 0 : 1, early ? 1 : 0, 0, 1),
++                    nir_imm_int(&b, 0), .write_mask = 15,
++                    .src_type = nir_type_float32,
++                    .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
++   if (exports)
++      nir_store_output(&b, nir_imm_float(&b, 0.25), nir_imm_int(&b, 0),
++                       .write_mask = 1, .src_type = nir_type_float32,
++                       .io_semantics = {.location = FRAG_RESULT_DEPTH, .num_slots = 1});
++   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
++   nir_validate_shader(b.shader, "Apple9 depth fixture input");
++   char path[4096];
++   snprintf(path, sizeof(path), "%s/%s.nir", directory, name);
++   FILE *nir = fopen(path, "w");
++   if (!nir) { perror(path); ralloc_free(b.shader); return false; }
++   nir_print_shader(b.shader, nir);
++   bool ok = !ferror(nir);
++   ok = fclose(nir) == 0 && ok;
++   struct agx_shader_part compiled = {0};
++   const char *reason = NULL;
++   if (ok)
++      ok = agx_compile_apple9_fragment(b.shader, &compiled, &reason);
++   if (!ok) {
++      fprintf(stderr, "depth fixture %s failed: %s\n", name, reason ? reason : "NIR output failed");
++      ralloc_free(b.shader);
++      free(compiled.binary);
++      return false;
++   }
++   const struct agx_shader_info *info = &compiled.info;
++   struct agx_apple9_render_stage stage = {
++      .binary = compiled.binary,
++      .binary_size = info->binary_size,
++      .publication_count_valid = true,
++      .publication_count = info->apple9_publication_count,
++      .preamble_size = info->apple9_preamble_size,
++      .scratch_size = info->scratch_size,
++      .render_targets = 1,
++      .writes_depth = info->depth_layout != FRAG_DEPTH_LAYOUT_UNCHANGED,
++      .early_fragment_tests = info->early_fragment_tests,
++      .uses_discard = info->apple9_uses_discard,
++      .actual_discard = info->apple9_actual_discard,
++      .reads_tile = info->apple9_reads_tile,
++      .apple9_reads_z = info->apple9_reads_z,
++   };
++   snprintf(path, sizeof(path), "%s/%s.bin", directory, name);
++   FILE *binary = fopen(path, "wb");
++   if (!binary) { perror(path); ok = false; }
++   else {
++      ok = fwrite(compiled.binary, 1, info->binary_size, binary) == info->binary_size;
++      ok = fclose(binary) == 0 && ok;
++   }
++   snprintf(path, sizeof(path), "%s/%s.json", directory, name);
++   FILE *json = fopen(path, "w");
++   if (!json) { perror(path); ok = false; }
++   else {
++      fprintf(json,
++              "{\"schema\":\"apple9-depth-compiler-probe-v1\",\"case\":\"%s\","
++              "\"requested_early\":%s,\"requested_export\":%s,"
++              "\"early_fragment_tests\":%s,\"depth_layout\":%u,"
++              "\"binary_size\":%u,\"publication_count\":%u,\"scratch_size\":%u,"
++              "\"actual_discard\":%s,\"uses_discard\":%s,"
++              "\"gate_supported\":%s,\"target_executed\":false}\n",
++              name, early ? "true" : "false", exports ? "true" : "false",
++              info->early_fragment_tests ? "true" : "false", info->depth_layout,
++              info->binary_size, info->apple9_publication_count, info->scratch_size,
++              info->apple9_actual_discard ? "true" : "false",
++              info->apple9_uses_discard ? "true" : "false",
++              agx_g15_graphics_stage_supported(&stage, true) ? "true" : "false");
++      ok = !ferror(json) && ok;
++      ok = fclose(json) == 0 && ok;
++   }
++   printf("APPLE9_DEPTH_COMPILED %s early=%u depth_layout=%u gate=%u bytes=%u\n",
++          name, info->early_fragment_tests, info->depth_layout,
++          agx_g15_graphics_stage_supported(&stage, true), info->binary_size);
++   free(compiled.binary);
++   ralloc_free(b.shader);
++   return ok;
++}
++
++int
++main(int argc, char **argv)
++{
++   if (argc != 2 || strlen(argv[1]) > 4000) {
++      fprintf(stderr, "usage: %s OUTPUT_DIRECTORY\n", argv[0]);
++      return 2;
++   }
++   glsl_type_singleton_init_or_ref();
++   bool ok = write_case(argv[1], "raster", false, false, false) &&
++             write_case(argv[1], "early", true, false, false) &&
++             write_case(argv[1], "late-export", false, true, false) &&
++             write_case(argv[1], "early-export", true, true, false) &&
++             write_case(argv[1], "depth-discard", false, true, true);
++   glsl_type_singleton_decref();
++   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
++}
+diff --git a/src/asahi/compiler/test/apple9-fs-progress-fixture.c b/src/asahi/compiler/test/apple9-fs-progress-fixture.c
+new file mode 100644
+index 0000000..3a787d4
+--- /dev/null
++++ b/src/asahi/compiler/test/apple9-fs-progress-fixture.c
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: MIT */
++#include "agx_compile_apple9.h"
++#include "compiler/nir/nir_builder.h"
++#include "gallium/drivers/asahi/agx_apple9.h"
++#include <stdio.h>
++#include <stdlib.h>
++
++int
++main(int argc, char **argv)
++{
++   if (argc != 2)
++      return 2;
++   glsl_type_singleton_init_or_ref();
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, &agx_nir_options, "fs_progress");
++   b.shader->info.io_lowered = true;
++   b.shader->info.num_ssbos = 1;
++   nir_def *bary = nir_load_barycentric_pixel(&b, 32,
++                                             .interp_mode = INTERP_MODE_SMOOTH);
++   nir_def *index = nir_load_interpolated_input(
++      &b, 1, 32, bary, nir_imm_int(&b, 0),
++      .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1},
++      .dest_type = nir_type_float32);
++   nir_def *pixel = nir_load_pixel_coord(&b);
++   nir_push_if(&b, nir_iand(&b,
++      nir_ieq_imm(&b, nir_channel(&b, pixel, 0), 34),
++      nir_ieq_imm(&b, nir_channel(&b, pixel, 1), 34)));
++   nir_def *offset = nir_ishl_imm(&b, nir_f2u32(&b,
++                                 nir_fadd_imm(&b, index, 0.5f)), 2);
++   nir_store_ssbo(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 0), offset,
++                  .write_mask = 1, .align_mul = 4);
++   nir_pop_if(&b, NULL);
++   nir_def *colour = nir_load_interpolated_input(
++      &b, 4, 32, bary, nir_imm_int(&b, 0),
++      .io_semantics = {.location = VARYING_SLOT_VAR1, .num_slots = 1},
++      .dest_type = nir_type_float32);
++   nir_store_output(&b, colour, nir_imm_int(&b, 0),
++      .write_mask = 15, .src_type = nir_type_float32,
++      .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
++   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
++   nir_validate_shader(b.shader, "FS progress fixture");
++   struct agx_shader_part compiled = {0};
++   const char *reason = NULL;
++   bool ok = agx_compile_apple9_fragment(b.shader, &compiled, &reason);
++   if (!ok) {
++      fprintf(stderr, "FS_PROGRESS_COMPILE_FAIL %s\n", reason);
++   } else {
++      FILE *file = fopen(argv[1], "wb");
++      ok = file && fwrite(compiled.binary, 1, compiled.info.binary_size, file) ==
++                   compiled.info.binary_size;
++      if (file) ok = fclose(file) == 0 && ok;
++      const struct agx_shader_info *i = &compiled.info;
++      printf("FS_PROGRESS_COMPILED bytes=%u scratch=%u resources=%u ssbo=%#x writes=%#x binding0=%u publication=%u preamble=%u merge_disabled=%u\n",
++         i->binary_size, i->scratch_size, i->apple9_resource_count,
++         i->apple9_resource_ssbo_mask, i->apple9_resource_write_mask,
++         i->apple9_resource_binding[0], i->apple9_publication_count,
++         i->apple9_preamble_size, i->disable_tri_merging);
++      struct agx_apple9_render_stage stage = {
++         .binary = compiled.binary, .binary_size = i->binary_size,
++         .publication_count_valid = true,
++         .publication_count = i->apple9_publication_count,
++         .preamble_size = i->apple9_preamble_size,
++         .scratch_size = i->scratch_size,
++         .render_targets = 1, .varying_components = 5,
++         .resource_count = i->apple9_resource_count,
++         .resource_ssbo_mask = i->apple9_resource_ssbo_mask,
++         .resource_write_mask = i->apple9_resource_write_mask,
++      };
++      memcpy(stage.resource_binding, i->apple9_resource_binding,
++             sizeof(stage.resource_binding));
++      unsetenv("ASAHI_G15_FS_PROGRESS");
++      bool gates = !agx_g15_graphics_stage_allowed(&stage, true);
++      setenv("ASAHI_G15_ALLOW", "all", 1);
++      gates &= !agx_g15_graphics_stage_allowed(&stage, true);
++      setenv("ASAHI_G15_FS_PROGRESS", "1", 1);
++      gates &= agx_g15_graphics_stage_allowed(&stage, true) &&
++               stage.resource_ssbo_mask == 1 && stage.resource_write_mask == 1;
++      /* The GLSL frontend introduces a UBO at API binding zero as well.
++       * Resource masks index compact table slots, not API binding numbers. */
++      struct agx_apple9_render_stage with_ubo = stage;
++      with_ubo.resource_count = 2;
++      with_ubo.resource_binding[1] = 0;
++      with_ubo.resource_ssbo_mask = with_ubo.resource_write_mask = 2;
++      gates &= agx_g15_graphics_stage_allowed(&with_ubo, true) &&
++               with_ubo.resource_ssbo_mask == 2 && with_ubo.resource_write_mask == 2;
++      with_ubo.resource_binding[1] = 1;
++      gates &= !agx_g15_graphics_stage_allowed(&with_ubo, true);
++      with_ubo.resource_binding[1] = 0;
++      with_ubo.resource_write_mask = 3;
++      gates &= !agx_g15_graphics_stage_allowed(&with_ubo, true);
++      stage.resource_binding[0] = 1;
++      gates &= !agx_g15_graphics_stage_allowed(&stage, true);
++      stage.resource_binding[0] = 0;
++      stage.resource_write_mask = 3;
++      gates &= !agx_g15_graphics_stage_allowed(&stage, true);
++      stage.resource_write_mask = 1;
++      stage.resource_ssbo_mask = 3;
++      gates &= !agx_g15_graphics_stage_allowed(&stage, true);
++      stage.resource_ssbo_mask = 1;
++      stage.image_mask = 1;
++      gates &= !agx_g15_graphics_stage_allowed(&stage, true);
++      stage.image_mask = 0;
++      gates &= !agx_g15_graphics_stage_allowed(&stage, false);
++      setenv("ASAHI_G15_FS_PROGRESS", "0", 1);
++      gates &= !agx_g15_graphics_stage_allowed(&stage, true);
++      printf("FS_PROGRESS_GATES %s default_off=1 allow_all_off=1 diagnostic_on=1 bad_binding_off=1 extra_write_off=1 extra_ssbo_off=1 images_off=1 vertex_off=1 explicit_zero_off=1 metadata_preserved=1 frontend_ubo_on=1 compact_bad_binding_off=1 ubo_write_off=1\n",
++             gates ? "PASS" : "FAIL");
++      ok = ok && gates;
++      ok = ok && !i->scratch_size && i->apple9_resource_ssbo_mask == 1 &&
++           i->apple9_resource_write_mask == 1 && i->apple9_resource_binding[0] == 0;
++   }
++   free(compiled.binary);
++   ralloc_free(b.shader);
++   glsl_type_singleton_decref();
++   return ok ? 0 : 1;
++}
+diff --git a/src/asahi/compiler/test/apple9-runtime-fixtures.c b/src/asahi/compiler/test/apple9-runtime-fixtures.c
+new file mode 100644
+index 0000000..86d6040
+--- /dev/null
++++ b/src/asahi/compiler/test/apple9-runtime-fixtures.c
+@@ -0,0 +1,158 @@
++/* SPDX-License-Identifier: MIT */
++#include "agx_compile_apple9.h"
++#include "compiler/nir/nir_builder.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static bool
++write_binary(const char *path, const struct agx_shader_part *compiled)
++{
++   FILE *file = fopen(path, "wb");
++   if (!file)
++      return false;
++   bool ok = fwrite(compiled->binary, 1, compiled->info.binary_size, file) ==
++             compiled->info.binary_size;
++   return fclose(file) == 0 && ok;
++}
++
++static bool
++write_metadata(const char *path, const struct agx_shader_info *info,
++               const struct agx_apple9_compute_profile *profile, const char *fixture)
++{
++   FILE *file = fopen(path, "w");
++   if (!file)
++      return false;
++   fprintf(file,
++           "{\n  \"schema\": \"g15-compiled-runtime-fixture-raw-v1\",\n"
++           "  \"target_execution\": false,\n"
++           "  \"fixture\": {\"name\": \"%s\", \"stage\": \"compute\", "
++           "\"local_size\": [1,1,1], \"num_ssbos\": 1, \"binding\": 0, "
++           "\"align_mul\": 4, \"output_offset_bytes\": 64},\n"
++           "  \"info\": {\"binary_size\": %u, \"main_size\": %u, "
++           "\"nr_gprs\": %u, \"scratch_size\": %u, \"local_size\": %u, "
++           "\"workgroup_size\": [%u,%u,%u], \"apple9_publication_count\": %u, "
++           "\"apple9_preamble_offset\": %u, \"apple9_preamble_size\": %u},\n"
++           "  \"profile\": {\"abi\": %u, \"resource_binding_count\": %u,\n",
++           fixture, info->binary_size, info->main_size, (unsigned)info->nr_gprs,
++           info->scratch_size, (unsigned)info->local_size,
++           (unsigned)info->workgroup_size[0], (unsigned)info->workgroup_size[1],
++           (unsigned)info->workgroup_size[2],
++           (unsigned)info->apple9_publication_count, info->apple9_preamble_offset,
++           info->apple9_preamble_size, (unsigned)profile->abi,
++           (unsigned)profile->resource_binding_count);
++   fprintf(file, "    \"resource_binding\": [");
++   for (unsigned i = 0; i < profile->resource_binding_count; ++i)
++      fprintf(file, "%s%u", i ? "," : "", (unsigned)profile->resource_binding[i]);
++   fprintf(file, "], \"resource_kind\": [");
++   for (unsigned i = 0; i < profile->resource_binding_count; ++i)
++      fprintf(file, "%s%u", i ? "," : "", (unsigned)profile->resource_kind[i]);
++   fprintf(file,
++           "], \"resource_read_mask\": %u, \"resource_write_mask\": %u, "
++           "\"writes_global\": %s, \"variable_local_size\": %s, "
++           "\"local_size\": [%u,%u,%u], "
++           "\"required_threadgroup_memory_bytes\": %u, \"scratch_size\": %u, "
++           "\"preamble_offset\": %u, \"preamble_size\": %u, "
++           "\"atomic_frame_size\": %u, \"publication_count\": %u}\n}\n",
++           profile->resource_read_mask, profile->resource_write_mask,
++           profile->writes_global ? "true" : "false",
++           profile->variable_local_size ? "true" : "false",
++           profile->local_size[0], profile->local_size[1], profile->local_size[2],
++           profile->required_threadgroup_memory_bytes, profile->scratch_size,
++           profile->preamble_offset, profile->preamble_size,
++           (unsigned)profile->atomic_frame_size,
++           (unsigned)profile->publication_count);
++   bool ok = !ferror(file);
++   return fclose(file) == 0 && ok;
++}
++
++static void
++build_vector(nir_builder *b)
++{
++   nir_def *input = nir_load_ssbo(b, 4, 32, nir_imm_int(b, 0),
++                                  nir_imm_int(b, 0), .align_mul = 4);
++   nir_def *value = nir_iadd_imm(b, nir_imul_imm(b, input, 3), 7);
++   nir_store_ssbo(b, value, nir_imm_int(b, 0), nir_imm_int(b, 64),
++                  .write_mask = 15, .align_mul = 4);
++}
++
++static void
++build_branch_loop(nir_builder *b)
++{
++   nir_def *binding = nir_imm_int(b, 0);
++   nir_def *limit = nir_umin(b, nir_load_ssbo(b, 1, 32, binding,
++      nir_imm_int(b, 0), .align_mul = 4), nir_imm_int(b, 8));
++   nir_def *selector = nir_load_ssbo(b, 1, 32, binding,
++      nir_imm_int(b, 4), .align_mul = 4);
++   nir_def *seed = nir_load_ssbo(b, 1, 32, binding,
++      nir_imm_int(b, 8), .align_mul = 4);
++   nir_variable *index = nir_local_variable_create(b->impl, glsl_uint_type(), "i");
++   nir_variable *sum = nir_local_variable_create(b->impl, glsl_uint_type(), "sum");
++   nir_store_var(b, index, nir_imm_int(b, 0), 1);
++   nir_store_var(b, sum, seed, 1);
++   nir_loop *loop = nir_push_loop(b);
++   loop->control = nir_loop_control_dont_unroll;
++   nir_def *i = nir_load_var(b, index);
++   nir_break_if(b, nir_uge(b, i, limit));
++   nir_def *offset = nir_iadd_imm(b, nir_ishl_imm(b, i, 2), 16);
++   nir_def *value = nir_load_ssbo(b, 1, 32, binding, offset, .align_mul = 4);
++   nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, nir_ixor(b, value, selector), 1), 0));
++   nir_store_var(b, sum, nir_iadd(b, nir_load_var(b, sum),
++      nir_iadd_imm(b, nir_imul_imm(b, value, 3), 7)), 1);
++   nir_store_ssbo(b, nir_imm_int(b, 1), binding, nir_imm_int(b, 72), .align_mul = 4);
++   nir_push_else(b, NULL);
++   nir_store_var(b, sum, nir_ixor(b, nir_load_var(b, sum),
++      nir_iadd_imm(b, value, 0x9e3779b9)), 1);
++   nir_store_ssbo(b, nir_imm_int(b, 2), binding, nir_imm_int(b, 72), .align_mul = 4);
++   nir_pop_if(b, NULL);
++   nir_store_var(b, index, nir_iadd_imm(b, i, 1), 1);
++   nir_pop_loop(b, loop);
++   nir_store_ssbo(b, nir_load_var(b, sum), binding,
++                  nir_imm_int(b, 64), .align_mul = 4);
++   nir_store_ssbo(b, nir_load_var(b, index), binding,
++                  nir_imm_int(b, 68), .align_mul = 4);
++}
++
++int
++main(int argc, char **argv)
++{
++   if (argc != 5 || (strcmp(argv[1], "vector") && strcmp(argv[1], "branch-loop")) ||
++       !strcmp(argv[2], argv[3]) || !strcmp(argv[2], argv[4]) || !strcmp(argv[3], argv[4])) {
++      fprintf(stderr, "usage: %s vector|branch-loop BODY.bin INPUT.nir METADATA.json\n", argv[0]);
++      return EXIT_FAILURE;
++   }
++   glsl_type_singleton_init_or_ref();
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_COMPUTE, &agx_nir_options, "apple9_runtime_%s", argv[1]);
++   b.shader->info.workgroup_size[0] = 1;
++   b.shader->info.workgroup_size[1] = 1;
++   b.shader->info.workgroup_size[2] = 1;
++   b.shader->info.workgroup_size_variable = false;
++   b.shader->info.num_ssbos = 1;
++   if (!strcmp(argv[1], "vector"))
++      build_vector(&b);
++   else
++      build_branch_loop(&b);
++   nir_validate_shader(b.shader, "authored runtime fixture input");
++   FILE *file = fopen(argv[3], "w");
++   bool ok = file != NULL;
++   if (file) {
++      nir_print_shader(b.shader, file);
++      ok = !ferror(file);
++      ok = fclose(file) == 0 && ok;
++   }
++   struct agx_shader_part compiled = {0};
++   struct agx_apple9_compute_profile profile = {0};
++   const char *reason = NULL;
++   if (ok)
++      ok = agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason);
++   if (!ok)
++      fprintf(stderr, "Apple9 fixture failed: %s\n", reason ? reason : "output file error");
++   else
++      ok = write_binary(argv[2], &compiled) &&
++           write_metadata(argv[4], &compiled.info, &profile, argv[1]);
++   free(compiled.binary);
++   ralloc_free(b.shader);
++   glsl_type_singleton_decref();
++   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
++}
+diff --git a/src/asahi/compiler/test/apple9-tiny-tool.c b/src/asahi/compiler/test/apple9-tiny-tool.c
+index 46ca9d1..e52effa 100644
+--- a/src/asahi/compiler/test/apple9-tiny-tool.c
++++ b/src/asahi/compiler/test/apple9-tiny-tool.c
+@@ -80,15 +80,16 @@ store_shader(enum tool_program program, unsigned first, unsigned second)
+ 
+ static nir_shader *
+ render_shader(bool fragment, bool constant, bool perspective, bool small,
+-              bool alternate)
++              bool alternate, bool linear, bool discard)
+ {
+    nir_builder b = nir_builder_init_simple_shader(
+       fragment ? MESA_SHADER_FRAGMENT : MESA_SHADER_VERTEX, &agx_nir_options,
+       "apple9_render_tool");
+    nir_def *color;
+    if (fragment) {
+-      nir_def *bary =
+-         nir_load_barycentric_pixel(&b, 32, .interp_mode = INTERP_MODE_SMOOTH);
++      nir_def *bary = nir_load_barycentric_pixel(
++         &b, 32,
++         .interp_mode = linear ? INTERP_MODE_NOPERSPECTIVE : INTERP_MODE_SMOOTH);
+       color = nir_load_interpolated_input(
+          &b, 3, 32, bary, nir_imm_int(&b, 0),
+          .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1},
+@@ -106,6 +107,8 @@ render_shader(bool fragment, bool constant, bool perspective, bool small,
+                             nir_imm_float(&b, 1))
+                  : nir_vec4(&b, nir_fmul(&b, r, r), nir_fadd_imm(&b, g, 0.125),
+                             nir_fmul_imm(&b, blue, 0.5), nir_imm_float(&b, 1));
++      if (discard)
++         nir_demote_if(&b, nir_flt_imm(&b, r, 0.5));
+       nir_store_output(
+          &b, color, nir_imm_int(&b, 0), .write_mask = 15,
+          .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1},
+@@ -174,7 +177,7 @@ usage:
+       fprintf(stderr, "       %s OUTPUT vertex|vertex-w|vertex-small\n",
+               argv[0]);
+       fprintf(stderr,
+-              "       %s OUTPUT fragment|fragment-alt|fragment-constant\n",
++              "       %s OUTPUT fragment|fragment-alt|fragment-constant|fragment-linear|fragment-discard\n",
+               argv[0]);
+       fprintf(stderr, "       %s OUTPUT dag\n", argv[0]);
+       fprintf(stderr, "       %s OUTPUT select-dag\n", argv[0]);
+@@ -188,11 +191,13 @@ usage:
+    bool perspective = argc == 3 && !strcmp(argv[2], "vertex-w");
+    bool small = argc == 3 && !strcmp(argv[2], "vertex-small");
+    bool alternate = argc == 3 && !strcmp(argv[2], "fragment-alt");
++   bool linear = argc == 3 && !strcmp(argv[2], "fragment-linear");
++   bool discard = argc == 3 && !strcmp(argv[2], "fragment-discard");
+    bool vertex =
+       perspective || small || (argc == 3 && !strcmp(argv[2], "vertex"));
+    bool constant = argc == 3 && !strcmp(argv[2], "fragment-constant");
+-   bool fragment =
+-      alternate || constant || (argc == 3 && !strcmp(argv[2], "fragment"));
++   bool fragment = alternate || constant || linear || discard ||
++                   (argc == 3 && !strcmp(argv[2], "fragment"));
+    if (vertex || fragment) {
+    } else if (argc == 3 && strcmp(argv[2], "gid") == 0) {
+       program = TOOL_PROGRAM_GLOBAL_ID;
+@@ -220,8 +225,11 @@ usage:
+ 
+    nir_shader *nir =
+       vertex || fragment
+-         ? render_shader(fragment, constant, perspective, small, alternate)
++         ? render_shader(fragment, constant, perspective, small, alternate,
++                         linear, discard)
+          : store_shader(program, first, second);
++   if (fragment)
++      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+    struct agx_shader_part compiled = {0};
+    struct agx_apple9_compute_profile profile = {0};
+    const char *reason = NULL;
+@@ -259,7 +267,14 @@ usage:
+    for (unsigned i = 0; i < profile.resource_binding_count; ++i)
+       fprintf(stderr, "%sarg%u=b%u", i ? "," : "", i,
+               profile.resource_binding[i]);
+-   fprintf(stderr, ")\n");
++   fprintf(stderr,
++           "; linear=%u flat=%u actual_discard=%u uses_discard=%u)\n",
++           compiled.info.apple9_linear_mask.lo != 0 ||
++              compiled.info.apple9_linear_mask.hi != 0,
++           compiled.info.apple9_flat_mask.lo != 0 ||
++              compiled.info.apple9_flat_mask.hi != 0,
++           compiled.info.apple9_actual_discard,
++           compiled.info.apple9_uses_discard);
+    free(compiled.binary);
+    ralloc_free(nir);
+    return EXIT_SUCCESS;
+diff --git a/src/asahi/compiler/test/apple9-write1337.c b/src/asahi/compiler/test/apple9-write1337.c
+new file mode 100644
+index 0000000..d5c66af
+--- /dev/null
++++ b/src/asahi/compiler/test/apple9-write1337.c
+@@ -0,0 +1,114 @@
++/* SPDX-License-Identifier: MIT */
++
++#include "agx_compile_apple9.h"
++#include "compiler/nir/nir_builder.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static bool
++write_binary(const char *path, const struct agx_shader_part *compiled)
++{
++   FILE *file = fopen(path, "wb");
++   if (!file)
++      return false;
++   bool ok = fwrite(compiled->binary, 1, compiled->info.binary_size, file) ==
++             compiled->info.binary_size;
++   return fclose(file) == 0 && ok;
++}
++
++static bool
++write_metadata(const char *path, const struct agx_shader_info *info,
++               const struct agx_apple9_compute_profile *profile)
++{
++   FILE *file = fopen(path, "w");
++   if (!file)
++      return false;
++   fprintf(file,
++           "{\n  \"schema\": \"g15-compiled-write1337-raw-v1\",\n"
++           "  \"target_execution\": false,\n"
++           "  \"fixture\": {\"stage\": \"compute\", \"local_size\": [1,1,1], "
++           "\"num_ssbos\": 1, \"binding\": 0, \"offset_bytes\": 0, "
++           "\"align_mul\": 4, \"value\": \"0x44a72000\"},\n"
++           "  \"info\": {\"binary_size\": %u, \"main_size\": %u, "
++           "\"nr_gprs\": %u, \"scratch_size\": %u, \"local_size\": %u, "
++           "\"workgroup_size\": [%u,%u,%u], \"apple9_publication_count\": %u, "
++           "\"apple9_preamble_offset\": %u, \"apple9_preamble_size\": %u},\n"
++           "  \"profile\": {\"abi\": %u, \"resource_binding_count\": %u,\n",
++           info->binary_size, info->main_size, (unsigned)info->nr_gprs,
++           info->scratch_size, (unsigned)info->local_size,
++           (unsigned)info->workgroup_size[0], (unsigned)info->workgroup_size[1],
++           (unsigned)info->workgroup_size[2],
++           (unsigned)info->apple9_publication_count, info->apple9_preamble_offset,
++           info->apple9_preamble_size, (unsigned)profile->abi,
++           (unsigned)profile->resource_binding_count);
++   fprintf(file, "    \"resource_binding\": [");
++   for (unsigned i = 0; i < profile->resource_binding_count; ++i)
++      fprintf(file, "%s%u", i ? "," : "", (unsigned)profile->resource_binding[i]);
++   fprintf(file, "], \"resource_kind\": [");
++   for (unsigned i = 0; i < profile->resource_binding_count; ++i)
++      fprintf(file, "%s%u", i ? "," : "", (unsigned)profile->resource_kind[i]);
++   fprintf(file,
++           "], \"resource_read_mask\": %u, \"resource_write_mask\": %u, "
++           "\"writes_global\": %s, \"variable_local_size\": %s, "
++           "\"local_size\": [%u,%u,%u], "
++           "\"required_threadgroup_memory_bytes\": %u, \"scratch_size\": %u, "
++           "\"preamble_offset\": %u, \"preamble_size\": %u, "
++           "\"atomic_frame_size\": %u, \"publication_count\": %u}\n}\n",
++           profile->resource_read_mask, profile->resource_write_mask,
++           profile->writes_global ? "true" : "false",
++           profile->variable_local_size ? "true" : "false",
++           profile->local_size[0], profile->local_size[1], profile->local_size[2],
++           profile->required_threadgroup_memory_bytes, profile->scratch_size,
++           profile->preamble_offset, profile->preamble_size,
++           (unsigned)profile->atomic_frame_size,
++           (unsigned)profile->publication_count);
++   bool ok = !ferror(file);
++   return fclose(file) == 0 && ok;
++}
++
++int
++main(int argc, char **argv)
++{
++   if (argc != 4 || !strcmp(argv[1], argv[2]) || !strcmp(argv[1], argv[3]) ||
++       !strcmp(argv[2], argv[3])) {
++      fprintf(stderr, "usage: %s OUTPUT.bin INPUT.nir METADATA.json\n", argv[0]);
++      return EXIT_FAILURE;
++   }
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_COMPUTE, &agx_nir_options, "apple9_write1337");
++   b.shader->info.workgroup_size[0] = 1;
++   b.shader->info.workgroup_size[1] = 1;
++   b.shader->info.workgroup_size[2] = 1;
++   b.shader->info.workgroup_size_variable = false;
++   b.shader->info.num_ssbos = 1;
++   nir_store_ssbo(&b, nir_imm_intN_t(&b, UINT32_C(0x44a72000), 32),
++                  nir_imm_int(&b, 0), nir_imm_int(&b, 0), .align_mul = 4);
++   nir_validate_shader(b.shader, "authored write1337 input");
++   FILE *nir_file = fopen(argv[2], "w");
++   if (!nir_file) {
++      perror(argv[2]);
++      ralloc_free(b.shader);
++      return EXIT_FAILURE;
++   }
++   nir_print_shader(b.shader, nir_file);
++   bool nir_ok = !ferror(nir_file);
++   if (fclose(nir_file) || !nir_ok) {
++      perror(argv[2]);
++      ralloc_free(b.shader);
++      return EXIT_FAILURE;
++   }
++   struct agx_shader_part compiled = {0};
++   struct agx_apple9_compute_profile profile = {0};
++   const char *reason = NULL;
++   bool ok = agx_compile_apple9_tiny(b.shader, &compiled, &profile, &reason);
++   if (!ok)
++      fprintf(stderr, "Apple9 compilation failed: %s\n", reason ? reason : "unknown");
++   else
++      ok = write_binary(argv[1], &compiled) &&
++           write_metadata(argv[3], &compiled.info, &profile);
++   free(compiled.binary);
++   ralloc_free(b.shader);
++   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
++}
+diff --git a/src/asahi/compiler/test/test-apple9.cpp b/src/asahi/compiler/test/test-apple9.cpp
+index 8ae9b4d..901c962 100644
+--- a/src/asahi/compiler/test/test-apple9.cpp
++++ b/src/asahi/compiler/test/test-apple9.cpp
+@@ -7139,6 +7139,51 @@ TEST(Apple9Compiler, TextureCoordinatesAndResultUseAllocatedRegisters)
+    ralloc_free(b.shader);
+ }
+ 
++TEST(Apple9Compiler, ExternalSamplerUsesOrdinary2DHardwarePath)
++{
++   std::vector<std::vector<uint8_t>> binaries;
++   for (auto dim : {GLSL_SAMPLER_DIM_2D, GLSL_SAMPLER_DIM_EXTERNAL}) {
++      SCOPED_TRACE(dim);
++      nir_builder b = nir_builder_init_simple_shader(
++         MESA_SHADER_FRAGMENT, &agx_nir_options, "apple9_external_texture");
++      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
++      tex->op = nir_texop_tex;
++      tex->sampler_dim = dim;
++      tex->dest_type = nir_type_float32;
++      tex->coord_components = 2;
++      tex->texture_index = 3;
++      tex->sampler_index = 5;
++      tex->src[0].src_type = nir_tex_src_coord;
++      tex->src[0].src = nir_src_for_ssa(nir_imm_vec2(&b, .375, .875));
++      nir_def_init(&tex->instr, &tex->def, 4, 32);
++      nir_builder_instr_insert(&b, &tex->instr);
++      nir_store_output(&b, &tex->def, nir_imm_int(&b, 0),
++                       .write_mask = 15, .src_type = nir_type_float32,
++                       .io_semantics = {.location = FRAG_RESULT_DATA0,
++                                        .num_slots = 1});
++      b.shader->info.io_lowered = true;
++
++      agx_apple9_sampler_key key[32] = {};
++      agx_apple9_texture_mapping mapping = {};
++      const char *reason = nullptr;
++      ASSERT_TRUE(agx_nir_lower_apple9_sampler_state(
++         b.shader, key, &mapping, &reason)) << (reason ?: "");
++      EXPECT_EQ(tex->sampler_dim, GLSL_SAMPLER_DIM_2D);
++
++      agx_shader_part compiled = {};
++      ASSERT_TRUE(agx_compile_apple9_fragment(b.shader, &compiled, &reason))
++         << (reason ?: "");
++      EXPECT_EQ(compiled.info.apple9_texture_mask, 1u << 3);
++      EXPECT_EQ(compiled.info.apple9_sampler_mask, 1u << 5);
++      auto *code = static_cast<uint8_t *>(compiled.binary);
++      binaries.emplace_back(code, code + compiled.info.binary_size);
++      free(compiled.binary);
++      ralloc_free(b.shader);
++   }
++   ASSERT_EQ(binaries.size(), 2u);
++   EXPECT_EQ(binaries[0], binaries[1]);
++}
++
+ TEST(Apple9Compiler, TextureLodQueryUsesNativeSamplerOperation)
+ {
+    for (unsigned filter : {PIPE_TEX_MIPFILTER_NONE, PIPE_TEX_MIPFILTER_NEAREST,
+diff --git a/src/asahi/lib/agx_bo.c b/src/asahi/lib/agx_bo.c
+index e67e354..e0a17d1 100644
+--- a/src/asahi/lib/agx_bo.c
++++ b/src/asahi/lib/agx_bo.c
+@@ -415,6 +415,12 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
+    if (bo->shim_cpu_epoch)
+       *bo->shim_cpu_epoch = 0; /* Cache reuse must opt in again. */
+    bo->label = label;
++   /* G15 multi-process diagnostic: ASAHI_G15_BO_LOG=1 prints every BO's VA
++    * range and label, to name the buffers near the GPU fault addresses. */
++   if (debug_get_bool_option("ASAHI_G15_BO_LOG", false))
++      fprintf(stderr, "asahi/g15 bo: va %#" PRIx64 "..%#" PRIx64 " size %#zx flags %#x %s\n",
++              (uint64_t)bo->va->addr, (uint64_t)(bo->va->addr + bo->size), (size_t)bo->size,
++              (unsigned)flags, label);
+    if (getenv("AGX_BO_TRACE_LABELS"))
+       fprintf(stderr, "AGX_BO_LABEL fd=%d handle=%u flags=%u size=%zu label=%s\n",
+               dev->fd, bo->uapi_handle, bo->flags, bo->size, label);
+diff --git a/src/asahi/lib/agx_device.c b/src/asahi/lib/agx_device.c
+index c972844..799d42c 100644
+--- a/src/asahi/lib/agx_device.c
++++ b/src/asahi/lib/agx_device.c
+@@ -6,6 +6,8 @@
+  */
+ 
+ #include "agx_device.h"
++#include "agx_g15_compute.h"
++#include "agx_g15_graphics.h"
+ #include "agx_apple9_layout.h"
+ #include <inttypes.h>
+ #include "clc/asahi_clc.h"
+@@ -551,12 +553,39 @@ agx_open_device(void *memctx, struct agx_device *dev)
+       drmFreeVersion(version);
+    }
+ 
++   memset(&dev->params, 0, sizeof(dev->params));
+    params_size = dev->ops.get_params(dev, &dev->params, sizeof(dev->params));
+    if (params_size <= 0) {
+       assert(0);
+       return false;
+    }
+-   assert(params_size >= sizeof(dev->params));
++   const char *g15_opt = getenv("ASAHI_G15_COMPUTE");
++   const char *g15_graphics_opt = getenv("ASAHI_G15_GRAPHICS");
++   bool compute_requested = g15_opt && strcmp(g15_opt, "1") == 0;
++   if (!agx_g15_graphics_select(&dev->params, params_size,
++                               g15_graphics_opt && strcmp(g15_graphics_opt, "1") == 0,
++                               compute_requested, dev->is_virtio,
++                               &dev->g15_graphics) ||
++       (!dev->g15_graphics &&
++        !agx_g15_compute_select(&dev->params, params_size,
++                               g15_opt && strcmp(g15_opt, "1") == 0,
++                               dev->is_virtio, &dev->g15_compute))) {
++      fprintf(stderr, "G15 requires exactly one explicit compute/graphics mode "
++                      "and its complete window contract\n");
++      return false;
++   }
++
++   /* The G15 kernel refuses SUBMIT from a client that has not opted in to
++    * its experimental contract (DRM_IOCTL_ASAHI_G15_OPT_IN, private UAPI). */
++   if ((dev->g15_graphics || dev->g15_compute) && !dev->is_virtio) {
++      struct {
++         uint32_t version, flags;
++      } opt_in = {.version = 1};
++      if (drmIoctl(dev->fd, DRM_IOW(DRM_COMMAND_BASE + 13, opt_in), &opt_in)) {
++         fprintf(stderr, "G15 opt-in failed: %s\n", strerror(errno));
++         return false;
++      }
++   }
+ 
+    assert(dev->params.gpu_generation >= 13);
+    const char *variant = " Unknown";
+@@ -611,7 +640,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
+     * for the complete 4-GiB heap there, so use the hardware address directly
+     * instead of requiring a kernel-side alias.
+     */
+-   if (fixed_apple9_usc_base) {
++   if (fixed_apple9_usc_base || dev->g15_compute || dev->g15_graphics) {
+       dev->shader_base = 1ull << 40;
+    } else {
+       // Put the USC heap at the bottom of the user address space, 4GiB aligned
+@@ -633,12 +662,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
+     * so this is a Mesa compatibility guard, not a hardware address limit.
+     * Executable/AGX_BO_LOW_VA allocations still use usc_heap.
+     */
+-   uint64_t user_start = fixed_apple9_usc_base
++   uint64_t user_start = (dev->g15_compute || dev->g15_graphics)
++                            ? default_shader_base + shader_size
++                            : fixed_apple9_usc_base
+                             ? default_shader_base
+                             : dev->shader_base + shader_size;
+ 
+-   assert(dev->shader_base >= dev->params.vm_start);
+-   assert(dev->shader_base + shader_size < dev->params.vm_end);
++   if (!dev->g15_compute && !dev->g15_graphics) {
++      assert(dev->shader_base >= dev->params.vm_start);
++      assert(dev->shader_base + shader_size < dev->params.vm_end);
++   }
+    assert(user_start < dev->params.vm_end);
+ 
+    dev->agxdecode = agxdecode_new_context(dev->shader_base);
+@@ -716,7 +749,24 @@ agx_open_device(void *memctx, struct agx_device *dev)
+ 
+    simple_mtx_init(&dev->vma_lock, mtx_plain);
+    util_vma_heap_init(&dev->main_heap, user_start, user_size);
+-   util_vma_heap_init(&dev->usc_heap, dev->shader_base, shader_size);
++
++   /* G15 multi-process diagnostic: ASAHI_G15_VA_SKEW=<bytes> reserves that
++    * much at the top of the main heap (allocations come from the top), so
++    * this process's buffers sit lower than another process's and a GPU fault
++    * address identifies which process's memory it names. */
++   if (dev->g15_graphics || dev->g15_compute) {
++      uint64_t skew = debug_get_num_option("ASAHI_G15_VA_SKEW", 0);
++      if (skew) {
++         skew = ALIGN_POT(skew, AIL_PAGESIZE);
++         uint64_t hole = util_vma_heap_alloc(&dev->main_heap, skew, AIL_PAGESIZE);
++         fprintf(stderr, "asahi/g15: VA skew %#" PRIx64 " reserved at %#" PRIx64 "\n", skew, hole);
++      }
++   }
++   uint64_t usc_start = (dev->g15_compute || dev->g15_graphics) ? dev->params.usc_window_start
++                                        : dev->shader_base;
++   uint64_t usc_size = (dev->g15_compute || dev->g15_graphics)
++                         ? dev->params.usc_window_end - usc_start : shader_size;
++   util_vma_heap_init(&dev->usc_heap, usc_start, usc_size);
+    /* The low 64 MiB contain existing fixed context/firmware aliases. The
+     * kernel owns the top of this aperture on native G16. PPP and VDM records
+     * occupy the remaining interval and are retained by their submitting batch.
+@@ -725,8 +775,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
+    uint64_t context_end =
+       MIN2(vm_create.kernel_start,
+            AGX_APPLE9_RENDER_CONTEXT_BASE + (1ull << 32));
++   if (dev->g15_graphics) {
++      context_start = dev->params.render_context_start;
++      context_end = dev->params.render_context_end;
++      if (context_end > user_start || context_end > vm_create.kernel_start ||
++          context_start >= context_end)
++         return false;
++   }
+    util_vma_heap_init(&dev->context_heap, context_start,
+-                      fixed_apple9_usc_base ? context_end - context_start : 0);
++                      (fixed_apple9_usc_base || dev->g15_graphics)
++                         ? context_end - context_start : 0);
+    dev->context_heap.alloc_high = false;
+ 
+    /* The compact Apple9 entry arena must start at the USC base. Allocate
+@@ -734,7 +792,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
+     * use the remaining 4-GiB aperture. Resource tables use full addresses.
+     * Older generations retain Mesa's usual high-to-low allocation policy.
+     */
+-   if (dev->params.gpu_generation >= 16)
++   if (dev->params.gpu_generation >= 16 || dev->g15_compute || dev->g15_graphics)
+       dev->usc_heap.alloc_high = false;
+ 
+    dev->vm_id = vm_create.vm_id;
+@@ -771,10 +829,54 @@ agx_open_device(void *memctx, struct agx_device *dev)
+ 
+    /* Apple9 GPUs require their generation-specific graphics path. */
+    dev->apple9_direct_render =
+-      dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P;
++      dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P || dev->g15_graphics;
+    dev->apple9_trace = agx_apple9_trace_enabled();
+-
+-   if (dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P) {
++   const char *mesa_eot = getenv("ASAHI_G15_MESA_EOT");
++   /* Mesa's own background and end-of-tile programs and the extra target
++    * formats are the default; ASAHI_G15_MESA_EOT=0, ASAHI_G15_MESA_BG=0 or
++    * ASAHI_G15_FORMATS=0 falls back to the bridge bundle's programs. */
++   dev->g15_mesa_eot = dev->g15_graphics && !(mesa_eot && !strcmp(mesa_eot, "0"));
++   const char *mesa_bg = getenv("ASAHI_G15_MESA_BG");
++   dev->g15_mesa_bg = dev->g15_graphics && !(mesa_bg && !strcmp(mesa_bg, "0"));
++   const char *formats = getenv("ASAHI_G15_FORMATS");
++   dev->g15_formats = dev->g15_mesa_bg && dev->g15_mesa_eot &&
++                      !(formats && !strcmp(formats, "0"));
++   const char *g15_stencil = getenv("ASAHI_G15_STENCIL");
++   /* Default on (stencil stored and loaded; the kernel's g15_render_stencil);
++    * ASAHI_G15_STENCIL=0 keeps stencil in tile memory only. */
++   dev->g15_stencil = dev->g15_graphics && !(g15_stencil && !strcmp(g15_stencil, "0"));
++   const char *g15_mips = getenv("ASAHI_G15_MIPS");
++   /* Default on: exact on hardware for every level up to 4096x4096, and the
++    * full glmark2 run is clean with it (n6mips2-*). */
++   dev->g15_mips = dev->g15_graphics && !(g15_mips && !strcmp(g15_mips, "0"));
++   const char *g15_depthonly = getenv("ASAHI_G15_DEPTHONLY");
++   /* Default on: exact at 128..2560x1664 with Z32F and Z16 (n6big2). */
++   dev->g15_depthonly = dev->g15_graphics && !(g15_depthonly && !strcmp(g15_depthonly, "0"));
++   const char *g15_z16 = getenv("ASAHI_G15_Z16");
++   /* Default on: depth modes exact against llvmpipe at 128..2560x1664
++    * (n6-z16); ASAHI_G15_Z16=0 refuses Z16 targets. */
++   dev->g15_z16 = dev->g15_graphics && !(g15_z16 && !strcmp(g15_z16, "0"));
++   const char *mesa_partial = getenv("ASAHI_G15_MESA_PARTIAL");
++   dev->g15_mesa_partial =
++      dev->g15_graphics && mesa_partial && !strcmp(mesa_partial, "1");
++   const char *batch_prims = getenv("ASAHI_G15_BATCH_PRIMS");
++   /* 32: a full-panel glmark2 run had 275 recovered tile-list timeouts at
++    * 128 and none at 32 (dense meshes stack primitives per tile). */
++   dev->g15_batch_prims = batch_prims ? MAX2(atoi(batch_prims), 1) : 32;
++   const char *batch_draws = getenv("ASAHI_G15_BATCH_DRAWS");
++   /* 8: with the kernel's PB descriptor slot fix and per-list relinker,
++    * Hyprland (foot, simple-egl, glmark windowed) runs 0 errors at 2, 4 and
++    * 8 draws of at most 32 primitives and reaches 60 fps at 8; 16 draws
++    * time out (capsweep3-225920). Weston's earlier failure at 2 or 4 draws
++    * predates the slot fix. */
++   dev->g15_batch_draws = batch_draws ? atoi(batch_draws) : 8;
++   const char *long_list_prims = getenv("ASAHI_G15_LONG_LIST_PRIMS");
++   /* 50: 50 full-target triangles keep every tile list within byte 0x40 at
++    * 1280..2560 wide; 51 cross it. */
++   dev->g15_long_list_prims = long_list_prims ? atoi(long_list_prims) : 50;
++
++   if (dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P ||
++       dev->g15_compute || dev->g15_graphics) {
+       simple_mtx_init(&dev->apple9_entry_lock, mtx_plain);
+       util_vma_heap_init(&dev->apple9_entry_heap, AGX_APPLE9_ENTRY_HEADER_SIZE,
+                         AGX_APPLE9_ENTRY_ARENA_SIZE - AGX_APPLE9_ENTRY_HEADER_SIZE);
+@@ -787,7 +889,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
+                        AGX_BO_EXEC | AGX_BO_LOW_VA | AGX_BO_WRITEBACK |
+                           AGX_BO_READONLY, "Apple9 shader entries");
+       if (!dev->apple9_entries ||
+-          dev->apple9_entries->va->addr != dev->shader_base) {
++          dev->apple9_entries->va->addr != usc_start) {
+          fprintf(stderr, "Failed to reserve compact Apple9 shader entries\n");
+          return false;
+       }
+@@ -851,7 +953,8 @@ agx_close_device(struct agx_device *dev)
+    agx_bo_unreference(dev, dev->scratch_bo);
+    u_printf_destroy(&dev->printf);
+    agx_bo_cache_evict_all(dev);
+-   if (dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P) {
++   if (dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P ||
++       dev->g15_compute || dev->g15_graphics) {
+       util_vma_heap_finish(&dev->apple9_entry_heap);
+       simple_mtx_destroy(&dev->apple9_entry_lock);
+    }
+@@ -871,7 +974,13 @@ agx_create_command_queue(struct agx_device *dev,
+                          enum drm_asahi_priority priority)
+ {
+ 
+-   if (dev->debug & AGX_DBG_1QUEUE) {
++   /* G15: every context shares one kernel queue. The kernel places each render
++    * queue's TVB blocks at the profile's fixed VAs, so a second queue in the
++    * same VM fails with EBUSY (Hyprland opens two contexts); G15 runs one job
++    * at a time anyway. */
++   bool one_queue = (dev->debug & AGX_DBG_1QUEUE) || dev->g15_graphics;
++
++   if (one_queue) {
+       // Abuse this lock for this, it's debug only anyway
+       simple_mtx_lock(&dev->vma_lock);
+       if (dev->queue_id) {
+@@ -893,7 +1002,7 @@ agx_create_command_queue(struct agx_device *dev,
+       assert(0);
+    }
+ 
+-   if (dev->debug & AGX_DBG_1QUEUE) {
++   if (one_queue) {
+       dev->queue_id = queue_create.queue_id;
+       simple_mtx_unlock(&dev->vma_lock);
+    }
+@@ -904,7 +1013,7 @@ agx_create_command_queue(struct agx_device *dev,
+ int
+ agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id)
+ {
+-   if (dev->debug & AGX_DBG_1QUEUE)
++   if ((dev->debug & AGX_DBG_1QUEUE) || dev->g15_graphics)
+       return 0;
+ 
+    struct drm_asahi_queue_destroy queue_destroy = {
+@@ -1084,7 +1193,7 @@ agx_gather_device_key(struct agx_device *dev)
+                    dev->params.num_dies > 1;
+ 
+    return (struct agx_device_key){
+-      .shader_isa = dev->params.gpu_generation >= 16
++      .shader_isa = dev->params.gpu_generation >= 16 || dev->g15_compute || dev->g15_graphics
+                        ? AGX_SHADER_ISA_APPLE9
+                        : AGX_SHADER_ISA_APPLE8,
+       .needs_g13x_coherency = u_tristate_make(g13x_coh),
+diff --git a/src/asahi/lib/agx_device.h b/src/asahi/lib/agx_device.h
+index ec7ff77..1340055 100644
+--- a/src/asahi/lib/agx_device.h
++++ b/src/asahi/lib/agx_device.h
+@@ -103,6 +103,41 @@ struct agx_device {
+    /* Environment options captured at device creation, immutable while in use. */
+    bool apple9_direct_render;
+    bool apple9_trace;
++   /* ASAHI_G15_COMPUTE=1: bounded experiment, not graphics/Vulkan support. */
++   bool g15_compute;
++   /* A separate, restricted ordinary-render experiment on the R8b bridge. */
++   bool g15_graphics;
++   /* ASAHI_G15_MESA_EOT=1: Mesa's own end-of-tile store instead of the
++    * bridge bundle's (needs g15_render_user_bgeot in the kernel). */
++   bool g15_mesa_eot;
++   /* R9: Mesa's reload program is always the background; every colour
++    * clear is a blitter draw (ASAHI_G15_MESA_BG=1). */
++   bool g15_mesa_bg;
++   /* BGRA8 and GPU-tiled colour targets (ASAHI_G15_FORMATS=1); they need
++    * Mesa's own tile programs (MESA_BG and MESA_EOT). */
++   bool g15_formats;
++   /* ASAHI_G15_STENCIL (default 1): bind the separate S8 buffer so stencil is
++    * stored and loaded between renders (needs the kernel's
++    * g15_render_stencil); stencil renders may then be split. */
++   bool g15_stencil;
++   /* GPU-tiled colour targets at mip levels above 0 (ASAHI_G15_MIPS, default 1). */
++   bool g15_mips;
++   /* Depth-only passes get a scratch colour target (ASAHI_G15_DEPTHONLY, default 1). */
++   bool g15_depthonly;
++   /* Z16 depth targets (ASAHI_G15_Z16, default 1). */
++   bool g15_z16;
++   /* ASAHI_G15_MESA_PARTIAL=1: Mesa's reload/store as the partial-render
++    * background and end-of-tile programs instead of the bundle's. */
++   bool g15_mesa_partial;
++   /* Triangles per G15 bridge render (ASAHI_G15_BATCH_PRIMS, default
++    * AGX_G15_BATCH_PRIMS). */
++   unsigned g15_batch_prims;
++   /* ASAHI_G15_BATCH_DRAWS: draws per render, 0 = no limit (default 1). */
++   unsigned g15_batch_draws;
++   /* G2: renders over this many primitives may give a tile list past byte
++    * 0x40 and are marked DRM_ASAHI_RENDER_G15_LONG_LISTS for the kernel's
++    * relinker (ASAHI_G15_LONG_LIST_PRIMS). */
++   unsigned g15_long_list_prims;
+ 
+    /* Precompiled libagx binary table */
+    const uint32_t **libagx_programs;
+diff --git a/src/asahi/lib/agx_g15_compute.h b/src/asahi/lib/agx_g15_compute.h
+new file mode 100644
+index 0000000..a58fae3
+--- /dev/null
++++ b/src/asahi/lib/agx_g15_compute.h
+@@ -0,0 +1,79 @@
++/* Copyright 2026 Brian Williams
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef AGX_G15_COMPUTE_H
++#define AGX_G15_COMPUTE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include "drm-uapi/asahi_drm.h"
++#include "agx_apple9_layout.h"
++#include "asahi/compiler/agx_apple9_profile.h"
++
++#define AGX_G15_USC_BASE (UINT64_C(1) << 40)
++#define AGX_G15_USC_USER_MIN (AGX_G15_USC_BASE + UINT64_C(0x10000000))
++#define AGX_G15_USC_END (AGX_G15_USC_BASE + (UINT64_C(1) << 32))
++#define AGX_G15_PAGE_SIZE UINT64_C(0x4000)
++
++/* An absent UAPI tail is compatible with older devices, but never enough to
++ * enable G15. The caller zeroes the query buffer before GET_PARAMS. */
++static inline bool
++agx_g15_compute_select(const struct drm_asahi_params_global *params,
++                       size_t returned_size, bool requested, bool virtio,
++                       bool *selected)
++{
++   if (!params || !selected)
++      return false;
++   *selected = false;
++   if (returned_size < offsetof(struct drm_asahi_params_global, usc_window_start))
++      return false;
++   if (params->gpu_generation != 15)
++      return true;
++   if (!requested || virtio ||
++       returned_size < offsetof(struct drm_asahi_params_global, render_context_start) ||
++       params->features != DRM_ASAHI_FEATURE_SOFT_FAULTS ||
++       params->max_commands_per_submission != 1 || params->max_attachments != 0)
++      return false;
++
++   uint64_t start = params->usc_window_start, end = params->usc_window_end;
++   if (start < AGX_G15_USC_USER_MIN || end > AGX_G15_USC_END || start >= end ||
++       ((start | end) & (AGX_G15_PAGE_SIZE - 1)) ||
++       (start & (AGX_APPLE9_ENTRY_ARENA_SIZE - 1)) ||
++       end - start < AGX_APPLE9_ENTRY_ARENA_SIZE + AGX_G15_PAGE_SIZE)
++      return false;
++   *selected = true;
++   return true;
++}
++
++static inline bool
++agx_g15_compute_shader_supported(const struct agx_apple9_compute_profile *p)
++{
++   return p && p->abi == AGX_APPLE9_COMPUTE_ABI_DIRECT_BUFFERS &&
++          p->resource_binding_count == 1 && p->resource_binding[0] == 0 &&
++          p->resource_kind[0] == AGX_APPLE9_COMPUTE_RESOURCE_SSBO &&
++          p->resource_write_mask == 1 && !(p->resource_read_mask & ~1u) &&
++          !p->writes_global && !p->variable_local_size &&
++          p->local_size[0] == 1 && p->local_size[1] == 1 && p->local_size[2] == 1 &&
++          !p->required_threadgroup_memory_bytes && !p->scratch_size &&
++          !p->preamble_size && !p->atomic_frame_size;
++}
++
++/* Keep cached entries and free-list positions arena-local. Only a launch
++ * boundary converts the actual entry GPUVA to the fixed USC-base offset. */
++static inline bool
++agx_apple9_entry_target_offset(uint64_t shader_base, uint64_t arena_address,
++                              uint32_t local_entry, uint32_t *offset)
++{
++   if (!offset || local_entry >= AGX_APPLE9_ENTRY_ARENA_SIZE ||
++       ((arena_address | local_entry) & 63) ||
++       arena_address < shader_base || arena_address > UINT64_MAX - local_entry)
++      return false;
++   uint64_t relative = arena_address + local_entry - shader_base;
++   if (relative > UINT32_MAX)
++      return false;
++   *offset = relative;
++   return true;
++}
++
++#endif
+diff --git a/src/asahi/lib/agx_g15_graphics.h b/src/asahi/lib/agx_g15_graphics.h
+new file mode 100644
+index 0000000..8be4e06
+--- /dev/null
++++ b/src/asahi/lib/agx_g15_graphics.h
+@@ -0,0 +1,85 @@
++/* Copyright 2026 Brian Williams
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef AGX_G15_GRAPHICS_H
++#define AGX_G15_GRAPHICS_H
++
++#include <stdlib.h>
++#include "agx_g15_compute.h"
++
++#define AGX_G15_CONTEXT_BASE UINT64_C(0x1000000000)
++#define AGX_G15_CONTEXT_USER_MIN UINT64_C(0x1004000000)
++#define AGX_G15_CONTEXT_END UINT64_C(0x1100000000)
++
++/* R8b has a separate VDM/PPP aperture. GET_PARAMS does not report the
++ * kernel's output size, so the zero-filled tail must also be validated. */
++static inline bool
++agx_g15_graphics_select(const struct drm_asahi_params_global *p,
++                       size_t returned_size, bool graphics_requested,
++                       bool compute_requested, bool virtio, bool *selected)
++{
++   if (!p || !selected)
++      return false;
++   *selected = false;
++   if (returned_size < offsetof(struct drm_asahi_params_global, usc_window_start))
++      return false;
++   if (p->gpu_generation != 15)
++      return true;
++   if (!graphics_requested)
++      return !compute_requested || returned_size >=
++         offsetof(struct drm_asahi_params_global, render_context_start);
++   bool compute_contract;
++   if (compute_requested || returned_size < sizeof(*p) ||
++       !agx_g15_compute_select(p, returned_size, true, virtio, &compute_contract) ||
++       !compute_contract)
++      return false;
++   uint64_t start = p->render_context_start, end = p->render_context_end;
++   if (start < AGX_G15_CONTEXT_USER_MIN || end > AGX_G15_CONTEXT_END ||
++       start >= end || ((start | end) & (AGX_G15_PAGE_SIZE - 1)) ||
++       end - start < UINT64_C(0x100000) || start < p->vm_start || end > p->vm_end)
++      return false;
++   *selected = true;
++   return true;
++}
++
++/* The bridge renders linear RGBA8 targets up to 256x256 (#10 R4): the kernel
++ * derives the size registers and target descriptors from the command, with
++ * rows at the AGX linear stride (width * 4 rounded up to 128 bytes). */
++#define AGX_G15_GRAPHICS_MAX_DIM 256
++/* The kernel's DRM_ASAHI_G15_RENDER_USER_RT_MAX_SIZE: a target's whole
++ * attachment (for a mip level, the whole tree) must fit. */
++#define AGX_G15_GRAPHICS_MAX_TARGET_BYTES 0x10000000ull
++
++static inline uint64_t
++agx_g15_graphics_target_stride(unsigned width)
++{
++   return ((uint64_t)width * 4 + 127) & ~UINT64_C(127);
++}
++
++static inline bool
++agx_g15_graphics_target_supported(unsigned width, unsigned height,
++                                  unsigned layers, unsigned samples,
++                                  unsigned level, unsigned first_layer,
++                                  unsigned last_layer, uint64_t stride,
++                                  uint64_t size, bool rgba8, bool linear)
++{
++   /* Targets up to 8192 per side, the kernel's default g15_render_max_dim
++    * (5120x3328 and 8192x8192 exact, n6big2); ASAHI_G15_MAX_DIM sets it
++    * (256..16384). The attachment must also fit 256 MiB. */
++   static unsigned max_dim;
++   if (!max_dim) {
++      const char *env = getenv("ASAHI_G15_MAX_DIM");
++      unsigned v = env ? (unsigned)strtoul(env, NULL, 0) : 8192;
++      max_dim = v >= AGX_G15_GRAPHICS_MAX_DIM && v <= 16384 ? v
++                                                          : AGX_G15_GRAPHICS_MAX_DIM;
++   }
++   return width >= 1 && width <= max_dim && height >= 1 &&
++          height <= max_dim && layers == 1 && samples == 1 &&
++          (level == 0 || !linear) && first_layer == 0 && last_layer == 0 &&
++          size <= AGX_G15_GRAPHICS_MAX_TARGET_BYTES &&
++          (!linear || (stride == agx_g15_graphics_target_stride(width) &&
++                       size >= stride * height)) &&
++          rgba8;
++}
++
++#endif
+diff --git a/src/asahi/lib/agx_va.c b/src/asahi/lib/agx_va.c
+index 2837988..1f5d11a 100644
+--- a/src/asahi/lib/agx_va.c
++++ b/src/asahi/lib/agx_va.c
+@@ -3,6 +3,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <stdlib.h>
++#include <string.h>
+ #include "agx_bo.h"
+ #include "agx_device.h"
+ 
+@@ -64,6 +66,18 @@ agx_va_free(struct agx_device *dev, struct agx_va *va, bool unbind)
+ 
+    struct util_vma_heap *heap = agx_vma_heap(dev, va->flags);
+ 
++   /* ASAHI_G15_VA_NOREUSE=1 (diagnostic): never hand a freed VA out again,
++    * to test whether G15 keeps stale translations after an unbind. */
++   static int noreuse = -1;
++   if (noreuse < 0) {
++      const char *env = getenv("ASAHI_G15_VA_NOREUSE");
++      noreuse = env && !strcmp(env, "1");
++   }
++   if (noreuse && !(va->flags & AGX_VA_FIXED)) {
++      free(va);
++      return;
++   }
++
+    simple_mtx_lock(&dev->vma_lock);
+    util_vma_heap_free(heap, va->addr, va->size_B);
+    simple_mtx_unlock(&dev->vma_lock);
+diff --git a/src/asahi/vulkan/hk_physical_device.c b/src/asahi/vulkan/hk_physical_device.c
+index cc5fd0f..8fc4756 100644
+--- a/src/asahi/vulkan/hk_physical_device.c
++++ b/src/asahi/vulkan/hk_physical_device.c
+@@ -1257,6 +1257,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
+       result = VK_ERROR_INCOMPATIBLE_DRIVER;
+       goto fail_pdev_alloc;
+    }
++   if (pdev->dev.g15_compute || pdev->dev.g15_graphics) {
++      result = vk_error(instance, VK_ERROR_INCOMPATIBLE_DRIVER);
++      goto fail_agx_device;
++   }
+ 
+    struct vk_physical_device_dispatch_table dispatch_table;
+    vk_physical_device_dispatch_table_from_entrypoints(
+diff --git a/src/compiler/glsl/gl_nir_linker.c b/src/compiler/glsl/gl_nir_linker.c
+index b24c46d..1bcaae2 100644
+--- a/src/compiler/glsl/gl_nir_linker.c
++++ b/src/compiler/glsl/gl_nir_linker.c
+@@ -1228,6 +1228,7 @@ gl_nir_add_point_size(nir_shader *nir)
+                   b.cursor = nir_after_instr(instr);
+                   nir_store_output(&b, nir_imm_float(&b, 1.0), nir_imm_int(&b, 0),
+                                    .io_semantics.location = VARYING_SLOT_PSIZ);
++                  found = true;
+                }
+             }
+          }
+@@ -1246,6 +1247,9 @@ gl_nir_add_point_size(nir_shader *nir)
+ 
+    nir->info.outputs_written |= VARYING_BIT_PSIZ;
+ 
++   if (nir->info.io_lowered)
++      nir_recompute_io_bases(nir, nir_var_shader_out);
++
+    /* We always modify the entrypoint */
+    return nir_progress(true, impl, nir_metadata_control_flow);
+ }
+diff --git a/src/compiler/glsl/tests/meson.build b/src/compiler/glsl/tests/meson.build
+index a7397aa..3b87fe8 100644
+--- a/src/compiler/glsl/tests/meson.build
++++ b/src/compiler/glsl/tests/meson.build
+@@ -4,6 +4,7 @@
+ general_ir_test_files = files(
+   'builtin_variable_test.cpp',
+   'general_ir_test.cpp',
++  'point_size_io_test.cpp',
+ )
+ general_ir_test_files += ir_expression_operation_h
+ 
+diff --git a/src/compiler/glsl/tests/point_size_io_test.cpp b/src/compiler/glsl/tests/point_size_io_test.cpp
+new file mode 100644
+index 0000000..ab43bbb
+--- /dev/null
++++ b/src/compiler/glsl/tests/point_size_io_test.cpp
+@@ -0,0 +1,98 @@
++/* SPDX-License-Identifier: MIT */
++#include <gtest/gtest.h>
++#include "gl_nir_linker.h"
++#include "nir_builder.h"
++
++class point_size_io_test : public ::testing::Test {
++protected:
++   const nir_shader_compiler_options options = {};
++   nir_builder b;
++
++   void SetUp() override
++   {
++      glsl_type_singleton_init_or_ref();
++      b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, &options,
++                                         "point_size_io");
++      b.shader->info.io_lowered = true;
++   }
++
++   void TearDown() override
++   {
++      ralloc_free(b.shader);
++      glsl_type_singleton_decref();
++   }
++
++   void store(unsigned location, unsigned components)
++   {
++      nir_store_output(&b, nir_imm_zero(&b, components, 32), nir_imm_int(&b, 0),
++                       .write_mask = (1u << components) - 1,
++                       .src_type = nir_type_float32,
++                       .io_semantics = {.location = location, .num_slots = 1});
++   }
++
++   void prepare()
++   {
++      nir_shader_gather_info(b.shader, b.impl);
++      nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
++   }
++
++   unsigned point_size_stores()
++   {
++      unsigned count = 0;
++      nir_foreach_block(block, b.impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic == nir_intrinsic_store_output &&
++                nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_PSIZ) {
++               EXPECT_EQ(nir_intrinsic_io_semantics(intr).num_slots, 1u);
++               EXPECT_LT(nir_intrinsic_base(intr), b.shader->num_outputs);
++               count++;
++            }
++         }
++      }
++      return count;
++   }
++};
++
++TEST_F(point_size_io_test, point_size_then_edgeflag)
++{
++   store(VARYING_SLOT_POS, 4);
++   store(VARYING_SLOT_COL0, 4);
++   prepare();
++   ASSERT_EQ(b.shader->num_outputs, 2u);
++
++   ASSERT_TRUE(gl_nir_add_point_size(b.shader));
++   EXPECT_EQ(point_size_stores(), 1u);
++   ASSERT_EQ(b.shader->num_outputs, 3u);
++   ASSERT_EQ(b.shader->num_outputs,
++             util_bitcount64(b.shader->info.outputs_written));
++
++   ASSERT_TRUE(nir_lower_passthrough_edgeflags(b.shader));
++   EXPECT_EQ(b.shader->num_outputs, 4u);
++   nir_shader_gather_info(b.shader, b.impl);
++   EXPECT_TRUE(b.shader->info.outputs_written & VARYING_BIT_EDGE);
++   nir_validate_shader(b.shader, "point size followed by edgeflag");
++}
++
++TEST_F(point_size_io_test, no_position_store)
++{
++   store(VARYING_SLOT_COL0, 4);
++   prepare();
++   ASSERT_TRUE(gl_nir_add_point_size(b.shader));
++   EXPECT_EQ(point_size_stores(), 1u);
++   EXPECT_EQ(b.shader->num_outputs, 2u);
++   nir_validate_shader(b.shader, "point size without position");
++}
++
++TEST_F(point_size_io_test, multiple_position_stores)
++{
++   store(VARYING_SLOT_POS, 4);
++   store(VARYING_SLOT_POS, 4);
++   prepare();
++   ASSERT_TRUE(gl_nir_add_point_size(b.shader));
++   EXPECT_EQ(point_size_stores(), 2u);
++   EXPECT_EQ(b.shader->num_outputs, 2u);
++   nir_validate_shader(b.shader, "point size after both position stores");
++}
+diff --git a/src/gallium/drivers/asahi/README.apple9-launchers.md b/src/gallium/drivers/asahi/README.apple9-launchers.md
+index 05a09d7..9f5321a 100644
+--- a/src/gallium/drivers/asahi/README.apple9-launchers.md
++++ b/src/gallium/drivers/asahi/README.apple9-launchers.md
+@@ -13,6 +13,50 @@ threadgroup-memory size. `agx_apple9.c` supplies those live parameters. The
+ fragment importer, library parser, external loader and fragment exporter have
+ been removed.
+ 
++## Opt-in G15 absolute target experiment
++
++`target_format` defaults to `AGX_APPLE9_LAUNCH_TARGET_COMPACT`, preserving the
++existing G16/G17 target bytes and callers. The distinct
++`AGX_APPLE9_LAUNCH_TARGET_G15_ABSOLUTE` format requires `shader_base == 1 << 40`.
++Its unsigned 32-bit `entry_offset` selects a 64-byte-aligned address within
++that fixed 4-GiB USC window. Misaligned entries, other bases and unknown formats
++reject the build without modifying the destination.
++
++This format places address bit 6 in instruction byte 2 bit 7 and address bits
++7 through 46 in bytes 3 through 7, little endian. Byte 8 remains a separate
++native control, zero for VS and four for FS/compute; byte 9 is zero. Successful
++native cap5 VS/FS captures and the qualified compute adapter are the comparison
++evidence. Private CPU tests compare the complete target instructions without
++using captured executable fragments in the implementation.
++
++Only target selection changes. This option does not select a device generation
++or qualify a complete G15 graphics launcher. The existing root loads, allocation,
++publication/frame encoding and preamble transfer retain their current contracts.
++G15 register allocation, stage roots and helper/preamble alignment still require
++separate native validation.
++
++## Experimental G15 compute wiring
++
++The opt-in `ASAHI_G15_COMPUTE=1` prototype requires physical G15, a complete
++608-byte GET_PARAMS reply with the known soft-fault feature and a valid separate
++USC window. Legacy devices retain the 592-byte params prefix and compact
++launcher. G15 keeps its physical generation; the checked profile selects the
++bounded Apple9 compiler and absolute target, without enabling direct graphics.
++
++The first compute scope is SSBO0 only, one writable buffer, local and dispatch
++dimensions `[1,1,1]`, with no textures, preamble, spills, shared memory, atomics,
++timestamp or precompiled helpers. Unsupported shaders fail compilation;
++unsupported helper or graphics submissions terminate with a diagnostic. Vulkan
++returns incompatible-driver. This is an experimental loader path, not complete
++GL/Vulkan capability support, and requires independent review before execution.
++
++USC allocations use the kernel-advertised window above the reserved aperture.
++Cached entries/free-list offsets remain arena-local; the wrapper's GPUVA and
++launch target use the actual entry BO address. Compiler bodies and inherited
++root/allocation/frame/helper encodings are unchanged. CPU checks do not qualify
++those controls on G15. Target acceptance requires the complete BO output and
++unchanged canary plus a signaled fence, since soft faults can discard stores.
++
+ ## Independent shader entry ABI (T8132)
+ 
+ Normal GLSL compilation produces complete VS, FS and CS bodies through NIR,
+diff --git a/src/gallium/drivers/asahi/agx_apple9.c b/src/gallium/drivers/asahi/agx_apple9.c
+index bd4d668..44ed7f9 100644
+--- a/src/gallium/drivers/asahi/agx_apple9.c
++++ b/src/gallium/drivers/asahi/agx_apple9.c
+@@ -8,6 +8,7 @@
+ #include "asahi/lib/pool.h"
+ #include "pipe/p_defines.h"
+ #include "agx_apple9_launch.h"
++#include "asahi/lib/agx_g15_compute.h"
+ 
+ #include <assert.h>
+ #include <stdio.h>
+@@ -204,7 +205,7 @@ apple9_build_sentinel_constant_program(uint8_t *out, unsigned slots)
+ }
+ 
+ static bool
+-apple9_build_compute_launch(uint8_t *out, uint64_t usc_exec_base,
++apple9_build_compute_launch(uint8_t *out, struct agx_device *dev,
+                             uint64_t launch_address, uint64_t resource_address,
+                             uint32_t main_offset,
+                             const struct agx_apple9_compute_profile *profile,
+@@ -220,8 +221,10 @@ apple9_build_compute_launch(uint8_t *out, uint64_t usc_exec_base,
+       .publication_count = profile->publication_count,
+       .preamble_address = preamble_address,
+       .launch_address = launch_address,
++      .target_format = dev->g15_compute ? AGX_APPLE9_LAUNCH_TARGET_G15_ABSOLUTE
++                                       : AGX_APPLE9_LAUNCH_TARGET_COMPACT,
+    };
+-   params.shader_base = usc_exec_base;
++   params.shader_base = dev->shader_base;
+    params.resource_table = resource_address;
+    params.resource_count =
+       profile->abi == AGX_APPLE9_COMPUTE_ABI_DESCRIPTOR_TABLES
+@@ -395,7 +398,8 @@ apple9_shader_entry(struct agx_device *dev, struct agx_bo *body, bool compute)
+             memcpy(bytes + 0x40, apple9_compute_constant, 0x40);
+          }
+          if (apple9_build_body_entry(bytes + AGX_APPLE9_ENTRY_CODE_OFFSET,
+-                                     dev->shader_base + entry, body->va->addr)) {
++                                     dev->apple9_entries->va->addr + entry,
++                                     body->va->addr)) {
+             agx_bo_note_cpu_write(dev->apple9_entries, block,
+                                   AGX_APPLE9_ENTRY_BLOCK_SIZE);
+             body->apple9_entry_offset = entry;
+@@ -424,10 +428,23 @@ agx_apple9_prepare_compute_dispatch(
+        resource_count != profile->resource_binding_count ||
+        !!preamble_address != !!profile->preamble_size)
+       return false;
++   if (dev->g15_compute &&
++       (!agx_g15_compute_shader_supported(profile) || !resources[0] ||
++        textures || samplers ||
++        geometry->mode != AGX_APPLE9_COMPUTE_GEOMETRY_DIRECT ||
++        geometry->threads[0] != 1 || geometry->threads[1] != 1 ||
++        geometry->threads[2] != 1 || geometry->local[0] != 1 ||
++        geometry->local[1] != 1 || geometry->local[2] != 1))
++      return false;
+ 
+    uint32_t entry = apple9_shader_entry(dev, body, true);
+    if (!entry)
+       return false;
++   uint32_t target_offset;
++   if (!agx_apple9_entry_target_offset(dev->shader_base,
++                                       dev->apple9_entries->va->addr,
++                                       entry, &target_offset))
++      return false;
+ 
+    size_t record_size = apple9_compute_resource_record_size_for_abi(abi);
+    struct agx_ptr record = agx_pool_alloc_aligned(usc_pool, record_size, 64);
+@@ -452,8 +469,8 @@ agx_apple9_prepare_compute_dispatch(
+ 
+    struct agx_ptr launch = agx_pool_alloc_aligned(
+       usc_pool, agx_apple9_compute_launch_size(profile), 64);
+-   if (!apple9_build_compute_launch(launch.cpu, dev->shader_base, launch.gpu,
+-                                    record.gpu, entry, profile, preamble_address))
++   if (!apple9_build_compute_launch(launch.cpu, dev, launch.gpu,
++                                    record.gpu, target_offset, profile, preamble_address))
+       return false;
+    *launch_address = launch.gpu;
+    return true;
+@@ -464,7 +481,7 @@ agx_apple9_compute_enabled(const struct agx_device *dev)
+ {
+    /* These generated launch and resource encodings have been exercised on
+     * T8132. Shared Apple9 ISA support alone does not validate G17P launch ABI. */
+-   return dev->chip == AGX_CHIP_G16G;
++   return dev->chip == AGX_CHIP_G16G || dev->g15_compute;
+ }
+ 
+ bool
+@@ -717,7 +734,8 @@ apple9_build_cf_bindings(uint8_t *table, unsigned components,
+ }
+ 
+ static void
+-apple9_build_direct_bind_group(uint8_t *page, unsigned varying_components)
++apple9_build_direct_bind_group(uint8_t *page, unsigned varying_components,
++                                bool g15)
+ {
+    static const struct {
+       uint16_t offset;
+@@ -745,6 +763,13 @@ apple9_build_direct_bind_group(uint8_t *page, unsigned varying_components)
+    apple9_put_u32(page + 0x2c, 4);
+    apple9_put_u32(page + 0x5c, 0x0001ffff);
+ 
++   /* G15 cap5 PRE3 PPP+0x900: the no-varying fragment prefix has zero
++    * words +4/+8/+0x18, with the launch at +0x14. With varyings, G15 takes
++    * the T8132 coefficient layout below: smooth gradients are exact, and
++    * without its byte deltas the fragment shader reads no varyings. */
++   if (g15 && !varying_components)
++      return;
++
+    /* Small G16 packing deltas established independently on T8132. */
+    page[0x05] = 0x01;
+    page[0x06] = 0x02;
+@@ -788,6 +813,16 @@ agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
+                         struct agx_apple9_uniform_draw *draw,
+                         const struct agx_apple9_uniform_draw *previous)
+ {
++   if (dev->g15_graphics &&
++       (!agx_g15_graphics_stage_allowed(&pipeline->vertex, false) ||
++        !agx_g15_graphics_stage_allowed(&pipeline->fragment, true) ||
++        pipeline->samples != 1 ||
++        (pipeline->color_formats[0] != PIPE_FORMAT_R8G8B8A8_UNORM &&
++         !(dev->g15_formats &&
++           (pipeline->color_formats[0] == PIPE_FORMAT_B8G8R8A8_UNORM ||
++            pipeline->color_formats[0] == PIPE_FORMAT_B8G8R8X8_UNORM ||
++            pipeline->color_formats[0] == PIPE_FORMAT_R8G8B8X8_UNORM)))))
++      return false;
+    const struct agx_apple9_render_stage *stages[] = {&pipeline->vertex,
+                                                      &pipeline->fragment};
+    unsigned tile_bytes = 0;
+@@ -819,6 +854,12 @@ agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
+                  stage, (unsigned long long)draw->code[stage]);
+          return false;
+       }
++      uint32_t target;
++      if (!agx_apple9_entry_target_offset(dev->shader_base,
++                                          dev->apple9_entries->va->addr,
++                                          offsets[stage], &target))
++         return false;
++      offsets[stage] = target;
+    }
+    for (unsigned stage = 0; stage < 2; stage++) {
+       const struct agx_apple9_render_stage *shader = stages[stage];
+@@ -863,6 +904,8 @@ agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
+          .frame_extent_b = shader->scratch_size,
+          .tile_bytes = stage ? tile_bytes : 0,
+          .samples = stage ? samples : 0,
++         .target_format = (dev->g15_compute || dev->g15_graphics) ? AGX_APPLE9_LAUNCH_TARGET_G15_ABSOLUTE
++                                          : AGX_APPLE9_LAUNCH_TARGET_COMPACT,
+       };
+       if (!agx_apple9_launch_build(
+              roots + 0x100, launch_size,
+@@ -882,6 +925,13 @@ agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
+          return false;
+       }
+       draw->launch[stage] = agx_usc_addr(dev, state.gpu + 0x100);
++      if (dev->apple9_trace) {
++         fprintf(stderr, "APPLE9_LAUNCH stage=%u roots=0x%" PRIx64 " entry=0x%x usc=0x%x bytes=",
++                 stage, state.gpu, offsets[stage], draw->launch[stage]);
++         for (unsigned i = 0; i < 0x100 + launch_size; ++i)
++            fprintf(stderr, "%02x", roots[i]);
++         fprintf(stderr, "\n");
++      }
+    }
+    bool reuse_coefficients = previous && pipeline->vertex.program_id &&
+                              pipeline->fragment.program_id &&
+@@ -889,7 +939,10 @@ agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
+                              previous->program_id[1] == draw->program_id[1] &&
+                              previous->flatshade_first == draw->flatshade_first;
+    unsigned cf_count;
+-   if (reuse_coefficients) {
++   if (dev->g15_graphics && !pipeline->vertex.varying_components) {
++      draw->coefficients = 0;
++      cf_count = 0;
++   } else if (reuse_coefficients) {
+       draw->coefficients = previous->coefficients;
+       cf_count = previous->cf_count;
+    } else {
+@@ -915,8 +968,10 @@ agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
+    }
+    apple9_put_u32(ppp + 4, counts[0] | (counts[1] << 8) | (counts[2] << 16));
+    uint8_t *group = ppp + 0x40;
+-   apple9_build_direct_bind_group(group, pipeline->vertex.varying_components);
+-   apple9_put_u32(group + 8, draw->coefficients);
++   apple9_build_direct_bind_group(group, pipeline->vertex.varying_components,
++                                   dev->g15_graphics);
++   if (!dev->g15_graphics || pipeline->vertex.varying_components)
++      apple9_put_u32(group + 8, draw->coefficients);
+    if (pipeline->fragment.apple9_reads_z)
+       apple9_put_u32(group + 0x20, apple9_get_u32(group + 0x20) | (1u << 21));
+    if (pipeline->fragment.reads_primitive_id)
+@@ -936,7 +991,8 @@ agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
+    /* Match the textured setup's native state, including with two user
+     * varyings. This field's full resource-count formula is unresolved;
+     * the varying-only estimate is insufficient to describe the captures. */
+-   apple9_put_u32(group + 0x18, MAX2(apple9_get_u32(group + 0x18), 1));
++   if (!dev->g15_graphics || pipeline->vertex.varying_components)
++      apple9_put_u32(group + 0x18, MAX2(apple9_get_u32(group + 0x18), 1));
+    apple9_put_u32(group + 0x14, draw->launch[1] / 0x40);
+    apple9_put_u32(group + 0x5c, tile_bytes ? 0x1ffff : 0);
+    /* Explicit per-sample stores preserve the omitted samples and require
+@@ -1002,6 +1058,22 @@ agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
+    apple9_put_u32(ppp + 0xf0, 0x100);
+    apple9_put_u32(ppp + 0xf4, draw->scissor_index |
+                                  ((uint32_t)draw->depth_bias_index << 16));
++   /* G2 single-factor A/Bs against the native p1-hotspot x192 PPP
++    * (tools/g15-g2-ppp-audit.py), one per process: ASAHI_G15_PPP_AB=
++    * cf0 (direct-bind +0x18 count = 0), wclamp (native W clamp 0x1e3ce508
++    * and Cull2 clamp-W bit 5), stencil0 (inactive stencil masks 0). */
++   {
++      const char *ab = getenv("ASAHI_G15_PPP_AB");
++      if (ab && !strcmp(ab, "cf0"))
++         apple9_put_u32(group + 0x18, 0);
++      else if (ab && !strcmp(ab, "wclamp")) {
++         apple9_put_u32(group + 0x64, 0x1e3ce508);
++         apple9_put_u32(group + 0x68, apple9_get_u32(group + 0x68) | 0x20);
++      } else if (ab && !strcmp(ab, "stencil0")) {
++         apple9_put_u32(group + 0x3c, apple9_get_u32(group + 0x3c) & ~0xffffu);
++         apple9_put_u32(group + 0x44, apple9_get_u32(group + 0x44) & ~0xffffu);
++      }
++   }
+    /* Compare only this canonical 256-byte record, in CPU storage. This
+     * bounded check reuses an immutable allocation; it neither scans an arena
+     * nor derives byte-range patches. A new batch has no predecessor. */
+@@ -1014,6 +1086,12 @@ agx_apple9_prepare_draw(struct agx_device *dev, struct agx_pool *usc_pool,
+       assert(address >= AGX_APPLE9_RENDER_CONTEXT_BASE &&
+              address - AGX_APPLE9_RENDER_CONTEXT_BASE <= UINT32_MAX);
+       draw->ppp = address - AGX_APPLE9_RENDER_CONTEXT_BASE;
++      if (dev->apple9_trace) {
++         fprintf(stderr, "APPLE9_PPP address=0x%" PRIx64 " bytes=", address);
++         for (unsigned i = 0; i < sizeof(draw->ppp_record); ++i)
++            fprintf(stderr, "%02x", ppp[i]);
++         fprintf(stderr, "\n");
++      }
+    }
+    return true;
+ }
+diff --git a/src/gallium/drivers/asahi/agx_apple9.h b/src/gallium/drivers/asahi/agx_apple9.h
+index 0853e51..9667668 100644
+--- a/src/gallium/drivers/asahi/agx_apple9.h
++++ b/src/gallium/drivers/asahi/agx_apple9.h
+@@ -9,6 +9,8 @@
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
+ #include "util/format/u_formats.h"
+ 
+ #include "asahi/lib/agx_apple9_layout.h"
+@@ -54,7 +56,9 @@ struct agx_apple9_render_stage {
+    struct agx_apple9_texture_mapping texture_mapping;
+    bool uses_texel_fetch;
+    bool uses_discard;
++   bool actual_discard;
+    bool writes_depth;
++   bool early_fragment_tests;
+    bool reads_tile;
+    bool disable_tri_merging;
+ 
+@@ -72,6 +76,118 @@ struct agx_apple9_render_stage {
+    uint8_t render_targets;
+ };
+ 
++static inline bool
++agx_g15_graphics_stage_supported(const struct agx_apple9_render_stage *s,
++                                  bool fragment)
++{
++   if (!s)
++      return false;
++
++   /* Graphics roots carry API UBOs, vertex buffers and the private sysval
++    * buffer. Keep buffer stores and SSBOs outside the G15 graphics profile.
++    * The graphics compiler's image mask describes fragment block exports. */
++   bool resources = s->resource_count <= AGX_APPLE9_MAX_GRAPHICS_BUFFERS;
++   for (unsigned i = 0; resources && i < s->resource_count; ++i)
++      resources = s->resource_binding[i] <= AGX_APPLE9_GRAPHICS_SYSVAL_BINDING &&
++                  (!fragment || s->resource_binding[i] < 32 ||
++                   s->resource_binding[i] == AGX_APPLE9_GRAPHICS_SYSVAL_BINDING);
++   return s->binary && s->binary_size && s->publication_count_valid &&
++          s->preamble_size <= AGX_APPLE9_MAX_PREAMBLE_BYTES &&
++          !s->scratch_size && resources &&
++          !s->resource_ssbo_mask && !s->resource_write_mask &&
++          (fragment ||
++           (!s->texture_mask && !s->sampler_mask && !s->image_mask)) &&
++          s->varying_components <= AGX_APPLE9_MAX_VARYING_COMPONENTS &&
++          !s->apple9_linear_mask.lo && !s->apple9_linear_mask.hi &&
++          !s->apple9_flat_mask.lo && !s->apple9_flat_mask.hi &&
++          !s->actual_discard && (!s->uses_discard || s->writes_depth) &&
++          (fragment || !s->writes_depth) &&
++          !(s->writes_depth && s->early_fragment_tests) &&
++          !s->reads_tile && !s->apple9_reads_z && !s->reads_primitive_id &&
++          !s->writes_point_size && !s->writes_layer_viewport &&
++          !s->reads_point_coord &&
++          s->position_components == (fragment ? 0 : 4) &&
++          s->render_targets == (fragment ? 1 : 0);
++}
++
++static inline bool
++agx_g15_feature_allowed(const char *allow, const char *feature)
++{
++   if (!allow)
++      return false;
++   if (!strcmp(allow, "all"))
++      return true;
++
++   const size_t feature_len = strlen(feature);
++   for (const char *token = allow; *token;) {
++      const char *end = strchr(token, ',');
++      const size_t token_len = end ? (size_t)(end - token) : strlen(token);
++      if (token_len == feature_len && !strncmp(token, feature, feature_len))
++         return true;
++      if (!end)
++         break;
++      token = end + 1;
++   }
++   return false;
++}
++
++/* The G15 gate actually applied: fragment shaders that read the tile
++ * (blending, logic ops) are admitted unless ASAHI_G15_ALLOW names a list
++ * without blend (or none). Qualified discard and non-perspective
++ * interpolation and qualified vertex textures follow the same default-on
++ * policy. */
++static inline bool
++agx_g15_graphics_stage_allowed(const struct agx_apple9_render_stage *s,
++                               bool fragment)
++{
++   if (!s)
++      return false;
++
++   const char *allow = getenv("ASAHI_G15_ALLOW");
++   struct agx_apple9_render_stage t = *s;
++
++   if (t.reads_tile &&
++       (!allow || agx_g15_feature_allowed(allow, "blend")))
++      t.reads_tile = false;
++
++   if (t.actual_discard &&
++       (!allow || agx_g15_feature_allowed(allow, "discard"))) {
++      t.actual_discard = false;
++      t.uses_discard = false;
++   }
++
++   if ((t.apple9_linear_mask.lo || t.apple9_linear_mask.hi) &&
++       (!allow || agx_g15_feature_allowed(allow, "linear")))
++      t.apple9_linear_mask = (struct agx_apple9_interp_mask){0};
++
++   /* Texture and sampler tables are stage-generic in the Apple9 launch ABI.
++    * Keep vertex sampling opt-in until the exact-image hardware qualification
++    * is complete. Images remain outside the bounded graphics profile. */
++   if (!fragment && !t.image_mask &&
++       (t.texture_mask || t.sampler_mask) &&
++       (!allow || agx_g15_feature_allowed(allow, "vertex_texture"))) {
++      t.texture_mask = 0;
++      t.sampler_mask = 0;
++   }
++
++   /* G2 diagnostic only: one writable fragment SSBO at API binding zero.
++    * Clear only the gate copy; submission retains the real BO write mask. */
++   const char *progress = getenv("ASAHI_G15_FS_PROGRESS");
++   unsigned ssbo = t.resource_ssbo_mask;
++   bool one_ssbo = ssbo && !(ssbo & (ssbo - 1));
++   unsigned slot = one_ssbo ? __builtin_ctz(ssbo) : 32;
++   if (fragment && progress && !strcmp(progress, "1") &&
++       slot < t.resource_count && t.resource_binding[slot] == 0 &&
++       one_ssbo && t.resource_write_mask == ssbo &&
++       !t.texture_mask && !t.sampler_mask && !t.image_mask &&
++       !t.writes_depth && !t.actual_discard && !t.reads_tile) {
++      t.resource_ssbo_mask = 0;
++      t.resource_write_mask = 0;
++   }
++
++   return agx_g15_graphics_stage_supported(&t, fragment);
++}
++
+ struct agx_apple9_render_pipeline {
+    /* Vertex fetch is lowered into the API vertex program. */
+    struct agx_apple9_render_stage vertex;
+diff --git a/src/gallium/drivers/asahi/agx_apple9_launch.c b/src/gallium/drivers/asahi/agx_apple9_launch.c
+index 097b39f..49778b9 100644
+--- a/src/gallium/drivers/asahi/agx_apple9_launch.c
++++ b/src/gallium/drivers/asahi/agx_apple9_launch.c
+@@ -59,7 +59,7 @@ encode_allocation(uint8_t out[8], enum agx_apple9_launch_stage stage,
+ }
+ 
+ static void
+-encode_target(uint8_t out[10], uint32_t entry_offset)
++encode_compact_target(uint8_t out[10], uint32_t entry_offset)
+ {
+    /* EXP200: the header and fixed control fields were constructed from live
+     * bit-forcing/clearing tests with authored shaders, including multi-frame
+@@ -77,6 +77,42 @@ encode_target(uint8_t out[10], uint32_t entry_offset)
+    out[8] = 0x80;
+ }
+ 
++static bool
++target_valid(const struct agx_apple9_launch_parameters *params)
++{
++   switch (params->target_format) {
++   case AGX_APPLE9_LAUNCH_TARGET_COMPACT:
++      return params->entry_offset <= AGX_APPLE9_ENTRY_MAX_OFFSET &&
++             !(params->entry_offset & 1);
++   case AGX_APPLE9_LAUNCH_TARGET_G15_ABSOLUTE:
++      /* The fixed base and u32 offset bound the sum to the 4-GiB window
++       * without overflow. Native VS entries demonstrate 64-byte alignment. */
++      return params->shader_base == (UINT64_C(1) << 40) &&
++             !(params->entry_offset & 63);
++   default:
++      return false;
++   }
++}
++
++static void
++encode_target(uint8_t out[10], enum agx_apple9_launch_stage stage,
++              const struct agx_apple9_launch_parameters *params)
++{
++   if (params->target_format == AGX_APPLE9_LAUNCH_TARGET_COMPACT) {
++      encode_compact_target(out, params->entry_offset);
++      return;
++   }
++
++   uint64_t target = params->shader_base + params->entry_offset;
++   memset(out, 0, 10);
++   write16(out, 0x177);
++   out[2] = 0x2a | (((target >> 6) & 1) << 7);
++   for (unsigned byte = 0; byte < 5; ++byte)
++      out[3 + byte] = (target >> 7) >> (8 * byte);
++   /* Captured native controls, separate from the address ending at byte 7. */
++   out[8] = stage == AGX_APPLE9_LAUNCH_VERTEX ? 0 : 4;
++}
++
+ static void
+ encode_frame(uint8_t out[10], const struct agx_apple9_launch_parameters *params)
+ {
+@@ -100,8 +136,8 @@ agx_apple9_launch_build(uint8_t *out, size_t capacity,
+    bool compute = stage == AGX_APPLE9_LAUNCH_COMPUTE;
+    size_t size = compute ? AGX_APPLE9_COMPUTE_LAUNCH_SIZE
+                          : AGX_APPLE9_GRAPHICS_LAUNCH_SIZE;
+-   if (capacity < size || params->entry_offset > AGX_APPLE9_ENTRY_MAX_OFFSET ||
+-       (params->entry_offset & 1) || params->publication_count > 1022 ||
++   if (capacity < size || !target_valid(params) ||
++       params->publication_count > 1022 ||
+        (params->threadgroup_memory_bytes &&
+         (!compute || !agx_apple9_launch_threadgroup_memory_supported(
+                         params->threadgroup_memory_bytes))) ||
+@@ -133,7 +169,7 @@ agx_apple9_launch_build(uint8_t *out, size_t capacity,
+    }
+    encode_allocation(program + at, stage, params);
+    at += 8;
+-   encode_target(program + at, params->entry_offset);
++   encode_target(program + at, stage, params);
+    at += 10;
+    encode_frame(program + at, params);
+    at += 10;
+diff --git a/src/gallium/drivers/asahi/agx_apple9_launch.h b/src/gallium/drivers/asahi/agx_apple9_launch.h
+index afdd469..4ad0cb2 100644
+--- a/src/gallium/drivers/asahi/agx_apple9_launch.h
++++ b/src/gallium/drivers/asahi/agx_apple9_launch.h
+@@ -14,6 +14,13 @@ enum agx_apple9_launch_stage {
+    AGX_APPLE9_LAUNCH_COMPUTE,
+ };
+ 
++enum agx_apple9_launch_target_format {
++   /* Default for existing G16/G17 callers. */
++   AGX_APPLE9_LAUNCH_TARGET_COMPACT = 0,
++   /* Target encoding only, not a complete G15 launch ABI. */
++   AGX_APPLE9_LAUNCH_TARGET_G15_ABSOLUTE,
++};
++
+ enum {
+    AGX_APPLE9_GRAPHICS_LAUNCH_SIZE = 256,
+    AGX_APPLE9_COMPUTE_LAUNCH_SIZE = 1024,
+@@ -37,6 +44,9 @@ struct agx_apple9_launch_parameters {
+     * Its BO has the same ownership/lifetime as the main shader. */
+    uint64_t preamble_address;
+    uint64_t launch_address;
++   /* G15 requires shader_base == 1 << 40 and a 64-byte-aligned entry_offset
++    * within that 4-GiB USC window. Other setup fields retain their existing ABI. */
++   enum agx_apple9_launch_target_format target_format;
+ };
+ 
+ /* Current T8132 execution evidence covers these allocation sizes. This does
+diff --git a/src/gallium/drivers/asahi/agx_batch.c b/src/gallium/drivers/asahi/agx_batch.c
+index 3414578..1457c3f 100644
+--- a/src/gallium/drivers/asahi/agx_batch.c
++++ b/src/gallium/drivers/asahi/agx_batch.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <xf86drm.h>
++#include "util/os_time.h"
+ #include "asahi/lib/agx_device_virtio.h"
+ #include "asahi/lib/decode.h"
+ #include "util/bitset.h"
+@@ -127,6 +128,9 @@ agx_batch_init(struct agx_context *ctx,
+ 
+    batch->apple9_render_initialized = false;
+    batch->apple9_draw_count = 0;
++   batch->g15_prims = 0;
++   batch->g15_draws = 0;
++   batch->g15_uncounted = false;
+ 
+    if (agx_batch_is_compute(batch)) {
+       batch->cdm = agx_encoder_allocate(dev, false);
+@@ -143,6 +147,7 @@ agx_batch_init(struct agx_context *ctx,
+ 
+    batch->clear = 0;
+    batch->apple9_color_reloaded = false;
++   batch->apple9_color_clear_launch = 0;
+    batch->apple9_color_reload_launch = 0;
+    batch->apple9_color_store_launch = 0;
+    batch->draw = 0;
+@@ -284,6 +289,9 @@ agx_batch_cleanup(struct agx_context *ctx, struct agx_batch *batch, bool reset)
+    agx_bo_unreference(dev, batch->cdm.bo);
+    batch->apple9_render_initialized = false;
+    batch->apple9_draw_count = 0;
++   batch->g15_prims = 0;
++   batch->g15_draws = 0;
++   batch->g15_uncounted = false;
+    agx_pool_cleanup(&batch->pool);
+    agx_pool_cleanup(&batch->pipeline_pool);
+    agx_pool_cleanup(&batch->apple9_context_pool);
+@@ -703,6 +711,9 @@ agx_add_sync(struct drm_asahi_sync *syncs, unsigned *count, uint32_t handle)
+    };
+ }
+ 
++/* ASAHI_G15_TIMING: set by agx_flush_batch. */
++uint64_t agx_g15_t_flush;
++
+ #define MAX_ATTACHMENTS 16
+ 
+ struct attachments {
+@@ -729,6 +740,11 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
+    struct agx_device *dev = agx_device(ctx->base.screen);
+    struct agx_screen *screen = agx_screen(ctx->base.screen);
+ 
++   if (dev->g15_graphics && (!render || compute || batch->cdm.bo)) {
++      fprintf(stderr, "G15 graphics cannot submit compute or mixed commands\n");
++      abort();
++   }
++
+    /* We allocate the worst-case sync array size since this won't be excessive
+     * for most workloads
+     */
+@@ -979,7 +995,14 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
+       .cmdbuf_size = cmdbuf.size,
+    };
+ 
++   static int g15_timing = -1;
++   if (g15_timing < 0)
++      g15_timing = dev->g15_graphics && getenv("ASAHI_G15_TIMING") != NULL;
++   uint64_t t_in = g15_timing ? os_time_get_nano() : 0;
+    int ret = dev->ops.submit(dev, &submit, &virt);
++   if (g15_timing)
++      fprintf(stderr, "G15M flush=%" PRIu64 " ioctl_in=%" PRIu64 " ioctl_out=%" PRIu64 "\n",
++              agx_g15_t_flush, t_in, os_time_get_nano());
+ 
+    u_rwlock_rdunlock(&screen->destroy_lock);
+ 
+@@ -995,6 +1018,22 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
+             "DRM_IOCTL_ASAHI_SUBMIT render failed: %m (%dx%d tile %dx%d layers %d samples %d)\n",
+             c->width_px, c->height_px, c->utile_width_px, c->utile_height_px,
+             c->layers, c->samples);
++         struct pipe_framebuffer_state *fb = &batch->key;
++         for (unsigned i = 0; i < fb->nr_cbufs; ++i) {
++            if (!fb->cbufs[i].texture)
++               continue;
++            struct agx_resource *r = agx_resource(fb->cbufs[i].texture);
++            fprintf(stderr, "  cbuf%u %s %ux%u level %u/%u tiling %d size 0x%" PRIx64
++                    " va 0x%" PRIx64 "\n", i, util_format_short_name(fb->cbufs[i].format),
++                    r->base.width0, r->base.height0, fb->cbufs[i].level,
++                    r->layout.levels, r->layout.tiling, (uint64_t)r->layout.size_B,
++                    agx_map_gpu(r));
++         }
++         if (fb->zsbuf.texture)
++            fprintf(stderr, "  zs %s depth 0x%" PRIx64 " stencil 0x%" PRIx64
++                    " zls 0x%" PRIx64 " pixels 0x%x\n",
++                    util_format_short_name(fb->zsbuf.format), (uint64_t)c->depth.base,
++                    (uint64_t)c->stencil.base, (uint64_t)c->zls_ctrl, c->isp_zls_pixels);
+       }
+ 
+       /* A failed submit has not published the timeline point allocated for
+diff --git a/src/gallium/drivers/asahi/agx_blit.c b/src/gallium/drivers/asahi/agx_blit.c
+index ba286d6..1753a4b 100644
+--- a/src/gallium/drivers/asahi/agx_blit.c
++++ b/src/gallium/drivers/asahi/agx_blit.c
+@@ -920,7 +920,10 @@ agx_apple9_reload_color(struct agx_batch *batch)
+       entry = _mesa_hash_table_insert(r->shaders, saved_key, fs);
+    }
+    struct hash_entry *store_entry = NULL;
+-   {
++   /* G15 keeps the bridge bundle's end-of-tile store unless Mesa's is
++    * selected; the background reload is always Mesa's. */
++   struct agx_device *dev = agx_device(pctx->screen);
++   if (!dev->g15_graphics || dev->g15_mesa_eot || dev->g15_mesa_partial) {
+       struct agx_color_reload_key store_key = key;
+       store_key.store = true;
+       store_entry = _mesa_hash_table_search(r->shaders, &store_key);
+@@ -1032,6 +1035,36 @@ agx_apple9_reload_color(struct agx_batch *batch)
+    return emitted;
+ }
+ 
++bool
++agx_apple9_clear_color(struct agx_batch *batch,
++                       const union pipe_color_union *color)
++{
++   struct agx_context *ctx = batch->ctx;
++
++   if (!color)
++      return false;
++
++   /* Compile the ordinary Mesa clear draw against this batch's render target,
++    * but retain only its fragment launch. The background dispatcher invokes
++    * that launch once per tile, so emitting its full-screen primitive here
++    * would clear the target twice and mark every tile nonempty. */
++   agx_blitter_save(ctx, ctx->blitter, ASAHI_CLEAR);
++
++   unsigned helper_draw = batch->apple9_draw_count;
++   batch->apple9_preparing_tile_helper = true;
++   util_blitter_clear(ctx->blitter, batch->key.width, batch->key.height,
++                      util_framebuffer_get_num_layers(&batch->key),
++                      PIPE_CLEAR_COLOR0, color, 0.0, 0,
++                      batch->tilebuffer_layout.nr_samples > 1);
++   batch->apple9_preparing_tile_helper = false;
++
++   bool emitted = batch->apple9_draw_count == helper_draw + 1;
++   if (emitted)
++      batch->apple9_color_clear_launch = batch->apple9_previous_draw.launch[1];
++
++   return emitted;
++}
++
+ static void *
+ asahi_raw_resolve_shader(struct pipe_context *pctx, unsigned src_samples,
+                          unsigned dst_samples,
+diff --git a/src/gallium/drivers/asahi/agx_g15_graphics_nir.h b/src/gallium/drivers/asahi/agx_g15_graphics_nir.h
+new file mode 100644
+index 0000000..594c26d
+--- /dev/null
++++ b/src/gallium/drivers/asahi/agx_g15_graphics_nir.h
+@@ -0,0 +1,29 @@
++/* Copyright 2026 Brian Williams
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef AGX_G15_GRAPHICS_NIR_H
++#define AGX_G15_GRAPHICS_NIR_H
++
++#include "compiler/nir/nir_builder.h"
++
++/* The G15 draw gate accepts only DrawArrays(first=0), one instance from
++ * instance zero, and draw ID zero. Specialize those frontend sysvals before
++ * the generic Apple9 pass would turn them into resource-table loads. */
++static inline bool
++agx_g15_lower_fixed_draw_sysval(nir_builder *b, nir_intrinsic_instr *intr,
++                               UNUSED void *data)
++{
++   switch (intr->intrinsic) {
++   case nir_intrinsic_load_first_vertex:
++   case nir_intrinsic_load_base_vertex:
++   case nir_intrinsic_load_base_instance:
++   case nir_intrinsic_load_draw_id:
++      b->cursor = nir_before_instr(&intr->instr);
++      nir_def_replace(&intr->def, nir_imm_intN_t(b, 0, intr->def.bit_size));
++      return true;
++   default:
++      return false;
++   }
++}
++
++#endif
+diff --git a/src/gallium/drivers/asahi/agx_pipe.c b/src/gallium/drivers/asahi/agx_pipe.c
+index 0d8d00a..38b7b91 100644
+--- a/src/gallium/drivers/asahi/agx_pipe.c
++++ b/src/gallium/drivers/asahi/agx_pipe.c
+@@ -9,9 +9,11 @@
+ #include <dlfcn.h>
+ #include <stdio.h>
+ #include <xf86drm.h>
++#include "util/os_time.h"
+ #include "asahi/compiler/agx_compile.h"
+ #include "asahi/layout/layout.h"
+ #include "asahi/lib/decode.h"
++#include "asahi/lib/agx_g15_graphics.h"
+ #include "drm-uapi/asahi_drm.h"
+ #include "drm-uapi/drm_fourcc.h"
+ #include "frontend/winsys_handle.h"
+@@ -472,6 +474,15 @@ agx_compression_allowed(const struct agx_resource *pres)
+       return false;
+    }
+ 
++   /* G15: compression is not qualified (ZLS depth is uncompressed in the
++    * native captures), and a compressed resource's CPU access goes through
++    * a staging blit that the bridge's copy path turns back into a mapping
++    * of the same resource, recursing without end. */
++   if (agx_device(pres->base.screen)->g15_graphics) {
++      rsrc_debug(pres, "No compression: G15\n");
++      return false;
++   }
++
+    return true;
+ }
+ 
+@@ -542,6 +553,20 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
+    nresource->base = *templ;
+    nresource->base.screen = screen;
+ 
++   /* The bridge's end-of-tile program writes a linear target. Other sizes
++    * and formats are created too; the draw and flush gates refuse them. */
++   if (dev->g15_graphics && !dev->g15_formats &&
++       (templ->bind & PIPE_BIND_RENDER_TARGET)) {
++      static const uint64_t linear = DRM_FORMAT_MOD_LINEAR;
++      bool allowed = !modifiers;
++      for (int i = 0; modifiers && i < count; ++i)
++         allowed |= modifiers[i] == DRM_FORMAT_MOD_LINEAR;
++      if (allowed) {
++         modifiers = &linear;
++         count = 1;
++      }
++   }
++
+    if (modifiers) {
+       nresource->modifier =
+          agx_select_modifier_from_list(nresource, modifiers, count);
+@@ -999,6 +1024,27 @@ agx_blit_to_staging(struct pipe_context *pctx, struct agx_transfer *trans)
+    agx_blit(pctx, &blit);
+ }
+ 
++/* ASAHI_G15_READ_INVAL=1 (diagnostic): clean and invalidate the whole BO
++ * from the CPU caches to the point of coherency before a CPU read, to test
++ * whether G15 render writes reach the CPU's view of memory. */
++static void
++agx_g15_read_inval(struct agx_bo *bo, unsigned usage)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *env = getenv("ASAHI_G15_READ_INVAL");
++      on = env && !strcmp(env, "1");
++   }
++   if (!on || !(usage & PIPE_MAP_READ))
++      return;
++#if defined(__aarch64__)
++   uint8_t *p = agx_bo_map(bo);
++   for (size_t off = 0; off < bo->size; off += 64)
++      __asm__ volatile("dc civac, %0" ::"r"(p + off) : "memory");
++   __asm__ volatile("dsb sy" ::: "memory");
++#endif
++}
++
+ static void *
+ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
+                  unsigned level,
+@@ -1096,6 +1142,7 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
+       transfer->map = calloc(transfer->base.layer_stride, box->depth);
+ 
+       if ((usage & PIPE_MAP_READ) && agx_resource_valid(rsrc, level)) {
++         agx_g15_read_inval(rsrc->bo, usage);
+          for (unsigned z = 0; z < box->depth; ++z) {
+             uint8_t *map = agx_map_texture_cpu(rsrc, level, box->z + z);
+             uint8_t *dst =
+@@ -1125,7 +1172,9 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
+          (uint64_t)ail_get_linear_pixel_B(&rsrc->layout, level, box->x,
+                                          box->y, box->z);
+ 
+-      return ((uint8_t *)agx_bo_map(rsrc->bo)) + offset;
++      uint8_t *ptr = ((uint8_t *)agx_bo_map(rsrc->bo)) + offset;
++      agx_g15_read_inval(rsrc->bo, usage);
++      return ptr;
+    }
+ }
+ 
+@@ -1184,6 +1233,82 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
+    struct agx_context *ctx = agx_context(pctx);
+    struct agx_batch *batch = agx_get_batch(ctx);
+ 
++   if (agx_device(pctx->screen)->g15_graphics) {
++      /* The bridge bundle's background program fills the whole target
++       * with opaque blue before any draw. A clear before the first draw of
++       * a batch relies on it; another colour is a blitter draw over it. */
++      /* Stencil: the first clear of a batch is the ZLS background
++       * (isp_bgobjvals), like depth; a later one is a blitter draw. */
++      bool has_stencil = batch->key.zsbuf.texture &&
++         util_format_has_stencil(util_format_description(batch->key.zsbuf.format));
++      if (!has_stencil)
++         buffers &= ~PIPE_CLEAR_STENCIL;
++      if (!buffers)
++         return;
++      unsigned depth_buf = buffers & PIPE_CLEAR_DEPTH;
++      unsigned stencil_buf = buffers & PIPE_CLEAR_STENCIL;
++      if ((buffers & ~(PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)) ||
++          scissor_state ||
++          ((buffers & PIPE_CLEAR_COLOR0) && !color) ||
++          (depth_buf && !batch->key.zsbuf.texture)) {
++         fprintf(stderr, "G15 bridge supports full colour and depth clears only\n");
++         return;
++      }
++      bool first = !batch->apple9_draw_count;
++      batch->resolve |= buffers;
++      /* Depth before the first draw is the ZLS clear (ISP background
++       * depth, as the native D32F captures clear it); after a draw it is a
++       * blitter draw like a colour clear. */
++      if (depth_buf && first) {
++         batch->clear |= PIPE_CLEAR_DEPTH;
++         batch->clear_depth = depth;
++         buffers &= ~PIPE_CLEAR_DEPTH;
++      }
++      if (stencil_buf && first) {
++         batch->clear |= PIPE_CLEAR_STENCIL;
++         batch->clear_stencil = stencil;
++         buffers &= ~PIPE_CLEAR_STENCIL;
++      }
++      if (first) {
++         batch->clear |= buffers & PIPE_CLEAR_COLOR0;
++         agx_batch_init_state(batch);
++         /* Mesa's end-of-tile store is prepared with the batch's first
++          * clear or draw, so a clear-only batch has it too. */
++         struct agx_device *g15 = agx_device(pctx->screen);
++         if ((g15->g15_mesa_eot || g15->g15_mesa_partial || g15->g15_mesa_bg) &&
++             (!agx_apple9_reload_color(batch) ||
++              !batch->apple9_color_store_launch)) {
++            fprintf(stderr, "G15 colour store program unavailable\n");
++            return;
++         }
++      }
++      if (!buffers)
++         return;
++      /* R9: the first colour clear of a batch is Mesa's clear program run
++       * as the tile background, as on other AGX generations. */
++      if (first && buffers == PIPE_CLEAR_COLOR0 &&
++          agx_device(pctx->screen)->g15_mesa_bg) {
++         union pipe_color_union c =
++            util_clamp_color(batch->key.cbufs[0].format, color);
++         if (agx_apple9_clear_color(batch, &c))
++            return;
++         fprintf(stderr, "G15 clear background program unavailable\n");
++      }
++      if (first && buffers == PIPE_CLEAR_COLOR0 &&
++          !agx_device(pctx->screen)->g15_mesa_bg) {
++         union pipe_color_union c =
++            util_clamp_color(batch->key.cbufs[0].format, color);
++         if (c.f[0] == 0.0f && c.f[1] == 0.0f && c.f[2] == 1.0f &&
++             c.f[3] == 1.0f)
++            return;
++      }
++      agx_blitter_save(ctx, ctx->blitter, ASAHI_CLEAR);
++      util_blitter_clear(ctx->blitter, ctx->framebuffer.width,
++                         ctx->framebuffer.height, 1, buffers, color, depth,
++                         stencil, false);
++      return;
++   }
++
+    if (unlikely(!agx_render_condition_check(ctx)))
+       return;
+ 
+@@ -1192,7 +1317,8 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
+    /* The generated background/partial-load entry reloads attachments. Color
+     * clears must therefore execute as ordinary Mesa fragment draws. Depth and
+     * stencil keep their fixed-function fast-clear path. */
+-   if (agx_apple9_direct_render_enabled(agx_device(pctx->screen))) {
++   if (agx_apple9_direct_render_enabled(agx_device(pctx->screen)) &&
++       !agx_device(pctx->screen)->g15_graphics) {
+       unsigned color_fast = fastclear & PIPE_CLEAR_COLOR;
+       slowclear |= color_fast;
+       fastclear &= ~color_fast;
+@@ -1386,6 +1512,11 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
+       if (zsres->separate_stencil)
+          sres = zsres->separate_stencil;
+ 
++      /* G15: the stencil buffer only when it can be stored and loaded;
++       * otherwise stencil lives in tile memory only. */
++      if (dev->g15_graphics && !agx_g15_stencil_storable(&batch->key))
++         sres = NULL;
++
+       unsigned level = zsbuf->level;
+       unsigned first_layer = zsbuf->first_layer;
+ 
+@@ -1453,6 +1584,9 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
+             c->stencil.comp_stride = (stride_lines - 1) << 14;
+          }
+ 
++         c->isp_bgobjvals |= clear_stencil;
++      } else if (dev->g15_graphics && util_format_has_stencil(desc)) {
++         /* Tile-only stencil still starts from the background value. */
+          c->isp_bgobjvals |= clear_stencil;
+       }
+    }
+@@ -1526,6 +1660,15 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
+    if (batch->clear & batch->resolve)
+       c->flags |= DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
+ 
++   /* G2: a render that may give a tile list past byte 0x40, which G15's
++    * fragment pass cannot consume; the kernel relinks only these. Each draw
++    * adds per-tile headers, so eight full-target quads (16 triangles)
++    * already cross it: flag every multi-draw render. */
++   if (dev->g15_graphics &&
++       (batch->g15_prims > dev->g15_long_list_prims || batch->g15_draws > 1 ||
++        batch->g15_uncounted))
++      c->flags |= DRM_ASAHI_RENDER_G15_LONG_LISTS;
++
+    if (batch->vs_scratch) {
+       c->flags |= DRM_ASAHI_RENDER_VERTEX_SCRATCH;
+       c->vertex_helper.data = batch->ctx->scratch_vs.buf->va->addr;
+@@ -1661,6 +1804,13 @@ static void
+ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
+                   struct drm_asahi_cmd_compute *cmdbuf)
+ {
++   struct agx_device *dev = agx_device(ctx->base.screen);
++   if (dev->g15_compute && (batch->cs_scratch || batch->timestamps.size ||
++                            batch->sampler_heap.bo || batch->sampler_heap.count)) {
++      fprintf(stderr, "Experimental G15 compute cannot submit spill, timestamp "
++                      "or sampler helpers\n");
++      abort();
++   }
+    /* Finalize the encoder */
+    agx_pack(batch->cdm.current, CDM_STREAM_TERMINATE, _)
+       ;
+@@ -1703,11 +1853,133 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
+    }
+ }
+ 
++/* G15 with ASAHI_G15_STENCIL=1: the framebuffer's stencil can be stored and
++ * loaded by the ZLS unit (uncompressed, GPU-tiled, single-level S8 of the
++ * framebuffer's size, sides >= 128 as the kernel checks). Otherwise stencil
++ * lives only in tile memory and a render holding it must not be split. */
++bool
++agx_g15_stencil_storable(const struct pipe_framebuffer_state *fb)
++{
++   if (!fb || !fb->zsbuf.texture ||
++       !agx_device(fb->zsbuf.texture->screen)->g15_stencil ||
++       !util_format_has_stencil(util_format_description(fb->zsbuf.format)))
++      return false;
++   struct agx_resource *z = agx_resource(fb->zsbuf.texture);
++   struct agx_resource *s = z->separate_stencil ? z->separate_stencil : z;
++   return s->layout.format == PIPE_FORMAT_S8_UINT &&
++          s->layout.tiling == AIL_TILING_GPU && !s->layout.compressed &&
++          s->layout.levels == 1 && s->base.width0 == fb->width &&
++          s->base.height0 == fb->height && fb->zsbuf.level == 0 &&
++          fb->zsbuf.first_layer == 0 && fb->zsbuf.last_layer == 0 &&
++          fb->width >= 128 && fb->height >= 128;
++}
++
++bool
++agx_g15_render_target_supported(const struct pipe_framebuffer_state *fb)
++{
++   if (!fb || fb->nr_cbufs != 1 || !fb->cbufs[0].texture) {
++      if (fb && getenv("AGX_G15_TRACE_TARGET"))
++         fprintf(stderr, "G15 colour target refused: cbufs %u first %s\n",
++                 fb->nr_cbufs,
++                 fb->nr_cbufs && fb->cbufs[0].texture ?
++                    util_format_short_name(fb->cbufs[0].format) : "none");
++      return false;
++   }
++   /* Depth: an uncompressed GPU-tiled Z32F buffer of the framebuffer's size,
++    * at least 64x64 (one 64x64 page per 16 KiB, as the kernel checks), as in
++    * the native D32F captures. Any depth format Mesa stores as Z32F counts
++    * (GL's DEPTH24 formats are emulated that way). A separate stencil is
++    * never bound: stencil tests are refused and stencil clears dropped. */
++   /* Z16 too (ASAHI_G15_Z16, default 1), one 128x64 page per 16 KiB (at least
++    * 128x64; the kernel reads the ZLS depth format). */
++   if (fb->zsbuf.texture) {
++      const struct agx_resource *z = agx_resource(fb->zsbuf.texture);
++      bool z16 = z->layout.format == PIPE_FORMAT_Z16_UNORM &&
++                 agx_device(fb->zsbuf.texture->screen)->g15_z16;
++      if (!util_format_has_depth(util_format_description(fb->zsbuf.format)) ||
++          (z->layout.format != PIPE_FORMAT_Z32_FLOAT && !z16) ||
++          (z16 && fb->width < 128) ||
++          z->layout.tiling != AIL_TILING_GPU || z->layout.compressed ||
++          z->layout.levels != 1 || MAX2(z->base.nr_samples, 1) != 1 ||
++          fb->zsbuf.level != 0 || fb->zsbuf.first_layer != 0 ||
++          fb->zsbuf.last_layer != 0 || z->base.width0 != fb->width ||
++          z->base.height0 != fb->height || fb->width < 64 || fb->height < 64) {
++         if (getenv("AGX_G15_TRACE_TARGET"))
++            fprintf(stderr, "G15 depth target refused: %s/%s layout %s sep %d "
++                    "tiling %d comp %d levels %u %ux%u fb %ux%u level %u layers %u-%u\n",
++                    util_format_short_name(fb->zsbuf.format),
++                    util_format_short_name(z->base.format),
++                    util_format_short_name(z->layout.format),
++                    z->separate_stencil != NULL, z->layout.tiling,
++                    z->layout.compressed, z->layout.levels, z->base.width0,
++                    z->base.height0, fb->width, fb->height, fb->zsbuf.level,
++                    fb->zsbuf.first_layer, fb->zsbuf.last_layer);
++         return false;
++      }
++   }
++   const struct pipe_surface *surf = &fb->cbufs[0];
++   const struct agx_resource *res = agx_resource(surf->texture);
++   bool formats = agx_device(surf->texture->screen)->g15_formats;
++   bool linear = res->modifier == DRM_FORMAT_MOD_LINEAR;
++   bool tiled = res->modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED &&
++                res->layout.tiling == AIL_TILING_GPU && !res->layout.compressed;
++   bool rgba = surf->format == PIPE_FORMAT_R8G8B8A8_UNORM &&
++               res->base.format == PIPE_FORMAT_R8G8B8A8_UNORM;
++   /* Scanout (GBM/KMS) buffers are the X variants of the same layouts. */
++   bool bgra = formats && surf->format == res->base.format &&
++               (surf->format == PIPE_FORMAT_B8G8R8A8_UNORM ||
++                surf->format == PIPE_FORMAT_B8G8R8X8_UNORM ||
++                surf->format == PIPE_FORMAT_R8G8B8X8_UNORM);
++   /* Levels above 0 of a GPU-tiled texture (ASAHI_G15_MIPS, default 1): the end-of-
++    * tile store addresses the level through its descriptor's level field and
++    * the background loads it with lod = level, both over the whole tree. */
++   bool level_ok = surf->level == 0 ||
++                   (tiled && agx_device(surf->texture->screen)->g15_mips);
++   bool ok = (linear || (formats && tiled)) && level_ok &&
++             res->layout.level_offsets_B[0] <= res->layout.size_B &&
++             agx_g15_graphics_target_supported(
++                fb->width, fb->height, util_framebuffer_get_num_layers(fb),
++                util_framebuffer_get_num_samples(fb), surf->level,
++                surf->first_layer, surf->last_layer,
++                linear ? ail_get_linear_stride_B(&res->layout, 0) : 0,
++                res->layout.size_B - res->layout.level_offsets_B[0],
++                rgba || bgra, linear);
++   if (!ok && getenv("AGX_G15_TRACE_TARGET"))
++      fprintf(stderr, "G15 colour target refused: %s/%s tiling %d comp %d "
++              "linear %d fb %ux%u layers %u samples %u level %u\n",
++              util_format_short_name(surf->format),
++              util_format_short_name(res->base.format), res->layout.tiling,
++              res->layout.compressed, linear, fb->width, fb->height,
++              util_framebuffer_get_num_layers(fb),
++              util_framebuffer_get_num_samples(fb), surf->level);
++   return ok;
++}
++
+ static bool
+ agx_flush_render(struct agx_context *ctx, struct agx_batch *batch,
+                  struct drm_asahi_cmd_render *cmdbuf)
+ {
+    struct agx_device *dev = agx_device(ctx->base.screen);
++   if (dev->g15_compute) {
++      fprintf(stderr, "Experimental G15 compute cannot submit graphics\n");
++      abort();
++   }
++
++   if (dev->g15_graphics) {
++      if (!agx_g15_render_target_supported(&batch->key) ||
++          (((batch->load & ~batch->clear & PIPE_CLEAR_COLOR0) ||
++            dev->g15_mesa_bg) &&
++           !batch->apple9_color_reload_launch) ||
++          ((dev->g15_mesa_eot || dev->g15_mesa_partial) &&
++           !batch->apple9_color_store_launch) ||
++          (dev->g15_mesa_partial && !batch->apple9_color_reload_launch) ||
++          batch->vs_scratch ||
++          batch->fs_scratch || batch->timestamps.size ||
++          batch->sampler_heap.bo || batch->sampler_heap.count || batch->cdm.bo) {
++         fprintf(stderr, "G15 bridge render outside the bounded triangle profile\n");
++         return false;
++      }
++   }
+ 
+    if (batch->vs_scratch)
+       agx_batch_add_bo(batch, ctx->scratch_vs.buf);
+@@ -1719,22 +1991,36 @@ agx_flush_render(struct agx_context *ctx, struct agx_batch *batch,
+    /* Apple9 keeps current at the native terminator emitted by the last draw.
+     * Appending either a draw or a buffer link replaces that terminator.
+     */
+-   if (batch->apple9_render_initialized) {
+-      uint32_t terminator;
++   /* On G15 the tile helpers initialize the package without emitting a
++    * draw, so a clear-only batch has no terminator yet. */
++   uint32_t terminator = 0;
++   if (batch->apple9_render_initialized)
+       memcpy(&terminator, batch->vdm.current, sizeof(terminator));
++   if (batch->apple9_render_initialized &&
++       (terminator == 0xc0000000 || !dev->g15_graphics)) {
+       assert(terminator == 0xc0000000);
+    } else {
+       uint8_t stop[5 + 64] = {0x00, 0x00, 0x00, 0xc0, 0x00};
+       memcpy(batch->vdm.current, stop, sizeof(stop));
+    }
+ 
+-   struct asahi_bg_eot pipeline_background =
+-      agx_build_bg_eot(batch, false, false);
+-
+-   struct asahi_bg_eot pipeline_background_partial =
+-      agx_build_bg_eot(batch, false, true);
++   if (dev->apple9_trace) {
++      uint8_t *start = agx_bo_map(batch->vdm.bo);
++      fprintf(stderr, "APPLE9_VDM address=0x%" PRIx64 " bytes=",
++              batch->vdm.bo->va->addr);
++      for (uint8_t *p = start; p < batch->vdm.current + 4; ++p)
++         fprintf(stderr, "%02x", *p);
++      fprintf(stderr, "\n");
++   }
+ 
+-   struct asahi_bg_eot pipeline_store = agx_build_bg_eot(batch, true, false);
++   struct asahi_bg_eot pipeline_background = {0};
++   struct asahi_bg_eot pipeline_background_partial = {0};
++   struct asahi_bg_eot pipeline_store = {0};
++   if (!dev->g15_graphics) {
++      pipeline_background = agx_build_bg_eot(batch, false, false);
++      pipeline_background_partial = agx_build_bg_eot(batch, false, true);
++      pipeline_store = agx_build_bg_eot(batch, true, false);
++   }
+ 
+    bool clear_pipeline_textures =
+       agx_tilebuffer_spills(&batch->tilebuffer_layout);
+@@ -1754,6 +2040,18 @@ agx_flush_render(struct agx_context *ctx, struct agx_batch *batch,
+                                               batch->scissor.size, 64);
+    uint64_t zbias = agx_pool_upload_aligned(
+       &batch->pool, batch->depth_bias.data, batch->depth_bias.size, 64);
++   if (dev->apple9_trace) {
++      /* G2 capture inventory: the scissor and depth-bias arrays the PPP
++       * scissor/depth-bias indices select (native: zero page samples). */
++      const uint8_t *sc = batch->scissor.data, *db = batch->depth_bias.data;
++      fprintf(stderr, "APPLE9_SCISSOR address=0x%" PRIx64 " bytes=", scissor);
++      for (unsigned i = 0; i < batch->scissor.size; ++i)
++         fprintf(stderr, "%02x", sc[i]);
++      fprintf(stderr, "\nAPPLE9_DEPTH_BIAS bytes=");
++      for (unsigned i = 0; i < batch->depth_bias.size; ++i)
++         fprintf(stderr, "%02x", db[i]);
++      fprintf(stderr, "\n");
++   }
+ 
+    /* BO list for a given batch consists of:
+     *  - BOs for the batch's pools
+@@ -1770,7 +2068,70 @@ agx_flush_render(struct agx_context *ctx, struct agx_batch *batch,
+               clear_pipeline_textures, batch->clear_depth, batch->clear_stencil,
+               &batch->tilebuffer_layout);
+ 
+-   if (agx_apple9_direct_render_enabled(dev)) {
++   /* G15 R7: the background reloads the target when the batch keeps its
++    * contents; otherwise the bundle's background clears it. The bundle's
++    * end-of-tile program stores it either way. The generic fill above tags
++    * absent programs with flag bits (usc 4), so clear all four first. */
++   if (dev->g15_graphics) {
++      memset(&cmdbuf->bg, 0, sizeof(cmdbuf->bg));
++      memset(&cmdbuf->eot, 0, sizeof(cmdbuf->eot));
++      memset(&cmdbuf->partial_bg, 0, sizeof(cmdbuf->partial_bg));
++      memset(&cmdbuf->partial_eot, 0, sizeof(cmdbuf->partial_eot));
++   }
++   if (dev->g15_graphics && dev->g15_mesa_bg &&
++       (batch->clear & PIPE_CLEAR_COLOR0) && batch->apple9_color_clear_launch) {
++      cmdbuf->bg.usc = batch->apple9_color_clear_launch;
++      cmdbuf->bg.rsrc_spec = 0;
++   } else if (dev->g15_graphics &&
++       ((batch->load & ~batch->clear & PIPE_CLEAR_COLOR0) || dev->g15_mesa_bg)) {
++      cmdbuf->bg.usc = batch->apple9_color_reload_launch;
++      cmdbuf->bg.rsrc_spec = 0;
++      agx_batch_add_bo(batch, dev->apple9_entries);
++   }
++   if (dev->g15_mesa_eot) {
++      cmdbuf->eot.usc = batch->apple9_color_store_launch;
++      cmdbuf->eot.rsrc_spec = 0;
++      agx_batch_add_bo(batch, dev->apple9_entries);
++   }
++   /* A partial render stores the tiles so far and reloads them before the
++    * rest of the scene: Mesa's store and reload programs, as for EOT/BG. */
++   if (dev->g15_mesa_partial) {
++      cmdbuf->partial_bg.usc = batch->apple9_color_reload_launch;
++      cmdbuf->partial_bg.rsrc_spec = 0;
++      cmdbuf->partial_eot.usc = batch->apple9_color_store_launch;
++      cmdbuf->partial_eot.rsrc_spec = 0;
++      agx_batch_add_bo(batch, dev->apple9_entries);
++   }
++
++   /* AGX_G15_TRACE_BATCH=1: one line per G15 render, to find which pass of
++    * a workload hangs. */
++   if (dev->g15_graphics && getenv("AGX_G15_TRACE_BATCH")) {
++      static unsigned seq;
++      const struct pipe_surface *cb = &batch->key.cbufs[0];
++      const struct agx_resource *cr = cb->texture ? agx_resource(cb->texture) : NULL;
++      const struct agx_resource *zr =
++         batch->key.zsbuf.texture ? agx_resource(batch->key.zsbuf.texture) : NULL;
++      fprintf(stderr,
++              "G15_BATCH %u %ux%u cbufs=%u fmt=%s tiling=%d mod=%#llx z=%s "
++              "draws=%u app_draws=%u prims=%u clear=%#x load=%#x "
++              "vs_id=%#llx fs_id=%#llx vs_code=%#llx fs_code=%#llx "
++              "vs_launch=%#x fs_launch=%#x bg=%#x eot=%#x\n",
++              seq++, batch->key.width, batch->key.height, batch->key.nr_cbufs,
++              cr ? util_format_short_name(cb->format) : "-",
++              cr ? (int)cr->layout.tiling : -1,
++              cr ? (unsigned long long)cr->modifier : 0ull,
++              zr ? util_format_short_name(batch->key.zsbuf.format) : "-",
++              batch->apple9_draw_count, batch->g15_draws, batch->g15_prims,
++              batch->clear, batch->load,
++              (unsigned long long)batch->g15_app_program_id[0],
++              (unsigned long long)batch->g15_app_program_id[1],
++              (unsigned long long)batch->g15_app_code[0],
++              (unsigned long long)batch->g15_app_code[1],
++              batch->g15_app_launch[0], batch->g15_app_launch[1],
++              cmdbuf->bg.usc, cmdbuf->eot.usc);
++   }
++
++   if (agx_apple9_direct_render_enabled(dev) && !dev->g15_graphics) {
+       if (batch->key.nr_cbufs > 8) {
+          fprintf(stderr,
+                  "Apple9 direct render supports up to eight color targets\n");
+@@ -1804,6 +2165,9 @@ agx_flush_render(struct agx_context *ctx, struct agx_batch *batch,
+ void
+ agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch)
+ {
++   /* ASAHI_G15_TIMING: CLOCK_MONOTONIC at flush start (agx_batch_submit prints). */
++   agx_g15_t_flush = os_time_get_nano();
++
+    assert(agx_batch_is_active(batch));
+    assert(!agx_batch_is_submitted(batch));
+ 
+@@ -1852,6 +2216,7 @@ agx_destroy_context(struct pipe_context *pctx)
+       util_blitter_destroy(ctx->blitter);
+ 
+    util_unreference_framebuffer_state(&ctx->framebuffer);
++   pipe_resource_reference(&ctx->g15_scratch_rt, NULL);
+ 
+    agx_bg_eot_cleanup(&ctx->bg_eot);
+    agx_cleanup_streamout(pctx);
+@@ -1873,7 +2238,8 @@ agx_destroy_context(struct pipe_context *pctx)
+          drmSyncobjDestroy(dev->fd, ctx->batches.slots[i].syncobj);
+    }
+ 
+-   dev->ops.bo_unbind_object(dev, ctx->timestamp_handle);
++   if (ctx->timestamp_handle)
++      dev->ops.bo_unbind_object(dev, ctx->timestamp_handle);
+    agx_bo_unreference(dev, ctx->timestamps);
+ 
+    u_rwlock_wrunlock(&screen->destroy_lock);
+@@ -2033,13 +2399,15 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
+    size_t timestamps_size = sizeof(struct agx_timestamps) * AGX_MAX_BATCHES;
+ 
+    /* The kernel requires that timestamp buffers are SHARED */
+-   ctx->timestamps =
++   if (!dev->g15_graphics) {
++      ctx->timestamps =
+       agx_bo_create(dev, timestamps_size, 0, AGX_BO_WRITEBACK | AGX_BO_SHARED,
+                     "Timestamp buffer");
+-   assert(ctx->timestamps);
++      assert(ctx->timestamps);
+ 
+-   ret = agx_bind_timestamps(dev, ctx->timestamps, &ctx->timestamp_handle);
+-   assert(!ret);
++      ret = agx_bind_timestamps(dev, ctx->timestamps, &ctx->timestamp_handle);
++      assert(!ret);
++   }
+ 
+    /* Sync object/FD used for NATIVE_FENCE_FD. */
+    ctx->in_sync_fd = -1;
+@@ -2099,6 +2467,14 @@ agx_query_memory_info(struct pipe_screen *pscreen,
+    };
+ }
+ 
++/* G2 diagnostic gate for the fragment SSBO progress probe (default off). */
++static bool
++agx_g15_fs_progress(void)
++{
++   const char *v = getenv("ASAHI_G15_FS_PROGRESS");
++   return v && !strcmp(v, "1");
++}
++
+ static void
+ agx_init_shader_caps(struct pipe_screen *pscreen)
+ {
+@@ -2173,6 +2549,10 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
+                                ? AGX_APPLE9_MAX_VARYING_COMPONENTS / 4 : 16;
+          caps->max_shader_buffers = caps->max_shader_images = 0;
+          caps->max_texture_samplers = caps->max_sampler_views = 16;
++         /* G2 diagnostic only (ASAHI_G15_FS_PROGRESS=1): one fragment SSBO
++          * for the progress probe; the G15 draw gate admits only that shape. */
++         if (i == MESA_SHADER_FRAGMENT && agx_g15_fs_progress())
++            caps->max_shader_buffers = 1;
+       }
+    }
+ }
+@@ -2286,7 +2666,7 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
+    caps->texture_multisample = true;
+    caps->image_load_formatted = true;
+    caps->image_store_formatted = true;
+-   caps->compute = true;
++   caps->compute = !screen->dev.g15_graphics;
+    caps->int64 = true;
+    caps->sample_shading = true;
+    caps->start_instance = true;
+@@ -2450,15 +2830,18 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
+       /* Public contexts expose the current graphics frontend contract.
+        * Internal NIR compute remains available for resource copies. */
+       caps->glsl_feature_level = caps->glsl_feature_level_compatibility = 330;
+-      /* ES 3.0 shader support is independent of the desktop GLSL level. */
+-      caps->essl_feature_level = 300;
++      /* ES 3.0 shader support is independent of the desktop GLSL level.
++       * The G2 progress diagnostic needs ESSL 3.10 for its fragment SSBO;
++       * the context version still comes only from a harness override. */
++      caps->essl_feature_level = agx_g15_fs_progress() ? 310 : 300;
+       /* Point size is carried by the vertex output interface. */
+       caps->point_size_fixed = PIPE_POINT_SIZE_LOWER_ALWAYS;
+       caps->robust_buffer_access_behavior = false;
+       /* EGL robustness context creation requires a contract we cannot provide. */
+       caps->device_reset_status_query = false;
+-      /* The Apple9 texture compiler does not lower external sampler dimensions. */
+-      caps->texture_external = false;
++      /* External samplers: the state tracker splits YUV planes first and
++       * the Apple9 compiler samples each remaining one as normalized 2D. */
++      caps->texture_external = true;
+       /* Cull distances still need primitive rejection lowering. */
+       caps->cull_distance = false;
+       /* One RGBA8 tile-output slot per active color attachment. */
+@@ -2486,6 +2869,17 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
+       caps->max_varyings = AGX_APPLE9_MAX_VARYING_COMPONENTS / 4;
+       caps->doubles = false;
+    }
++
++   if (screen->dev.g15_graphics) {
++      caps->query_timestamp = caps->query_time_elapsed = false;
++      caps->query_pipeline_statistics = caps->query_pipeline_statistics_single = false;
++      caps->draw_indirect = caps->multi_draw_indirect = false;
++      caps->multi_draw_indirect_params = false;
++      caps->supported_prim_modes = BITFIELD_BIT(MESA_PRIM_TRIANGLES) |
++                                   BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP) |
++                                   BITFIELD_BIT(MESA_PRIM_TRIANGLE_FAN);
++      caps->supported_prim_modes_with_restart = 0;
++   }
+ }
+ 
+ static bool
+@@ -2502,6 +2896,10 @@ agx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
+    if (sample_count > 1 && sample_count != 4 && sample_count != 2)
+       return false;
+ 
++   /* The G15 bridge renders single-sample targets only. */
++   if (sample_count > 1 && agx_device(pscreen)->g15_graphics)
++      return false;
++
+    if (sample_count > 1 && agx_device(pscreen)->debug & AGX_DBG_NOMSAA)
+       return false;
+ 
+diff --git a/src/gallium/drivers/asahi/agx_state.c b/src/gallium/drivers/asahi/agx_state.c
+index 2d71f53..c2ec942 100644
+--- a/src/gallium/drivers/asahi/agx_state.c
++++ b/src/gallium/drivers/asahi/agx_state.c
+@@ -14,6 +14,8 @@
+ static _Atomic uint64_t apple9_program_serial;
+ #include "asahi/compiler/agx_compile.h"
+ #include "asahi/compiler/agx_compile_apple9.h"
++#include "asahi/lib/agx_g15_compute.h"
++#include "agx_g15_graphics_nir.h"
+ #include "asahi/compiler/agx_nir.h"
+ #include "asahi/genxml/agx_pack.h"
+ #include "asahi/layout/layout.h"
+@@ -1068,6 +1070,39 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
+ 
+    util_copy_framebuffer_state(&ctx->framebuffer, state);
+ 
++   /* G15 (ASAHI_G15_DEPTHONLY=1): a depth-only pass gets a scratch RGBA8
++    * colour target of its size, so it runs on the colour-plus-depth path
++    * the kernel and Mesa's tile programs support. Colour writes land in the
++    * scratch target and are never read. */
++   struct pipe_framebuffer_state *fb = &ctx->framebuffer;
++   if (agx_device(pctx->screen)->g15_depthonly && fb->nr_cbufs == 0 &&
++       fb->zsbuf.texture && fb->width && fb->height) {
++      struct pipe_resource *s = ctx->g15_scratch_rt;
++      if (!s || s->width0 != fb->width || s->height0 != fb->height) {
++         pipe_resource_reference(&ctx->g15_scratch_rt, NULL);
++         const struct pipe_resource templ = {
++            .target = PIPE_TEXTURE_2D,
++            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
++            .width0 = fb->width,
++            .height0 = fb->height,
++            .depth0 = 1,
++            .array_size = 1,
++            .bind = PIPE_BIND_RENDER_TARGET,
++         };
++         ctx->g15_scratch_rt =
++            pctx->screen->resource_create(pctx->screen, &templ);
++      }
++      if (ctx->g15_scratch_rt) {
++         struct pipe_surface *c = &fb->cbufs[0];
++         pipe_resource_reference(&c->texture, ctx->g15_scratch_rt);
++         c->format = PIPE_FORMAT_R8G8B8A8_UNORM;
++         c->level = 0;
++         c->first_layer = c->last_layer = 0;
++         c->nr_samples = 0;
++         fb->nr_cbufs = 1;
++      }
++   }
++
+    for (unsigned i = 0; i < ctx->framebuffer.nr_cbufs; ++i) {
+       agx_legalize_compression(ctx,
+                                agx_resource(ctx->framebuffer.cbufs[i].texture),
+@@ -1834,6 +1869,19 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
+          FREE(compiled);
+          return NULL;
+       }
++      if (dev->g15_compute &&
++          (!agx_g15_compute_shader_supported(&compiled->apple9_compute_profile) ||
++           early->info.cs.has_variable_shared_mem ||
++           compiled->b.info.apple9_texture_mask ||
++           compiled->b.info.apple9_sampler_mask ||
++           compiled->b.info.apple9_image_mask)) {
++         fprintf(stderr, "Experimental G15 compute requires one SSBO0, "
++                         "local[1,1,1], and no setup/scratch/texture helpers\n");
++         free(compiled->b.binary);
++         ralloc_free(early);
++         FREE(compiled);
++         return NULL;
++      }
+ 
+       for (unsigned i = 0; i < 32; ++i)
+          compiled->apple9_compute_textures.samplers[i] = i;
+@@ -2000,6 +2048,9 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
+          if (key_->fs.apple9_polygon_stipple)
+             NIR_PASS(_, apple9_nir, agx_nir_lower_poly_stipple);
+       }
++      if (!fragment && dev->g15_graphics)
++         NIR_PASS(_, apple9_nir, nir_shader_intrinsics_pass,
++                  agx_g15_lower_fixed_draw_sysval, nir_metadata_control_flow, NULL);
+       if (!fragment && !key_->vs.apple9_inputs.capture_xfb)
+          agx_nir_lower_apple9_sysvals(apple9_nir, MESA_SHADER_VERTEX);
+       if (fragment && key_->fs.nr_samples <= 1) {
+@@ -2035,9 +2086,23 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
+       ralloc_free(apple9_nir);
+    }
+ 
+-   struct agx_compiled_shader *compiled = agx_compile_nir(
+-      dev, nir, &pctx->debug, so->type, false, so->type != MESA_SHADER_FRAGMENT,
+-      false, 0, attrib_components_read);
++   struct agx_compiled_shader *compiled;
++   if (dev->g15_graphics && apple9_render &&
++       so->type == MESA_SHADER_FRAGMENT && nir->info.internal &&
++       apple9_stage.info.apple9_image_mask) {
++      /* The tile-store helper uses Apple9 workgroup coordinates and physical
++       * tile formats that the legacy fragment compiler cannot represent.
++       * Its actual compiler already supplies the metadata and executable.
++       */
++      compiled = CALLOC_STRUCT(agx_compiled_shader);
++      compiled->stage = so->type;
++      compiled->b.info = apple9_stage.info;
++      compiled->b.info.binary_size = 0;
++   } else {
++      compiled = agx_compile_nir(
++         dev, nir, &pctx->debug, so->type, false,
++         so->type != MESA_SHADER_FRAGMENT, false, 0, attrib_components_read);
++   }
+ 
+    if (so->type == MESA_SHADER_FRAGMENT) {
+       /* XXX: don't replicate this all over the driver */
+@@ -2121,7 +2186,9 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
+             .texture_mapping = apple9_texture_mapping,
+             .uses_texel_fetch = apple9_stage.info.apple9_uses_texel_fetch,
+             .uses_discard = apple9_stage.info.apple9_uses_discard,
++            .actual_discard = apple9_stage.info.apple9_actual_discard,
+             .writes_depth = apple9_stage.info.depth_layout != FRAG_DEPTH_LAYOUT_UNCHANGED,
++            .early_fragment_tests = apple9_stage.info.early_fragment_tests,
+             .disable_tri_merging = apple9_stage.info.disable_tri_merging,
+          };
+       } else {
+@@ -2188,6 +2255,13 @@ agx_get_shader_variant(struct agx_screen *screen, struct pipe_context *pctx,
+                        struct agx_uncompiled_shader *so,
+                        union asahi_shader_key *key)
+ {
++   if ((screen->dev.g15_compute && so->type != MESA_SHADER_COMPUTE) ||
++       (screen->dev.g15_graphics && so->type != MESA_SHADER_VERTEX &&
++        so->type != MESA_SHADER_FRAGMENT)) {
++      fprintf(stderr, "Experimental G15 mode rejects shader stage %s\n",
++              mesa_shader_stage_name(so->type));
++      return NULL;
++   }
+    bool apple9_compute = so->type == MESA_SHADER_COMPUTE &&
+                          agx_apple9_compute_enabled(&screen->dev);
+    bool apple9_render =
+@@ -2203,6 +2277,27 @@ agx_get_shader_variant(struct agx_screen *screen, struct pipe_context *pctx,
+       if (!compiled)
+          return NULL;
+ 
++      if (screen->dev.g15_graphics &&
++          !agx_g15_graphics_stage_allowed(&compiled->apple9_render_stage,
++                                          so->type == MESA_SHADER_FRAGMENT)) {
++         const struct agx_apple9_render_stage *rs = &compiled->apple9_render_stage;
++         fprintf(stderr,
++                 "G15 graphics stage %s outside the bounded profile: resources=%u "
++                 "binding0=%u varyings=%u linear=%d flat=%d preamble=%u scratch=%u "
++                 "ubo=%x tex=%x discard=%d psiz=%d layer=%d clip=%u pos=%u rts=%u\n",
++                 mesa_shader_stage_name(so->type), rs->resource_count,
++                 rs->resource_count ? rs->resource_binding[0] : 0,
++                 rs->varying_components,
++                 rs->apple9_linear_mask.lo || rs->apple9_linear_mask.hi,
++                 rs->apple9_flat_mask.lo || rs->apple9_flat_mask.hi,
++                 rs->preamble_size, rs->scratch_size, rs->ubo_mask,
++                 rs->texture_mask, rs->uses_discard, rs->writes_point_size,
++                 rs->writes_layer_viewport, rs->clip_distance_count,
++                 rs->position_components, rs->render_targets);
++         agx_delete_compiled_shader(&screen->dev, compiled);
++         return NULL;
++      }
++
+       if (!apple9_bounded)
+          agx_disk_cache_store(screen->disk_cache, so, key, compiled);
+    }
+@@ -3952,6 +4047,10 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
+                    void *args, size_t arg_size)
+ {
+    struct agx_device *dev = agx_device(batch->ctx->base.screen);
++   if (dev->g15_compute || dev->g15_graphics) {
++      fprintf(stderr, "Experimental G15 cannot execute precompiled helpers\n");
++      abort();
++   }
+    struct agx_precompiled_shader *cs =
+       agx_get_precompiled(&batch->ctx->bg_eot, program);
+ 
+@@ -4235,17 +4334,28 @@ agx_batch_init_state(struct agx_batch *batch)
+    bool apple9_direct =
+       agx_apple9_direct_render_enabled(agx_device(batch->ctx->base.screen));
+ 
+-   if (apple9_direct) {
++   /* ASAHI_G15_VDM_BARRIER=0 drops the barrier on G15 (for comparison). */
++   static int g15_barrier = -1;
++   if (g15_barrier < 0) {
++      const char *env = getenv("ASAHI_G15_VDM_BARRIER");
++      g15_barrier = !(env && !strcmp(env, "0"));
++   }
++
++   if (apple9_direct && (!agx_device(batch->ctx->base.screen)->g15_graphics ||
++                         g15_barrier)) {
+       /* Completed render work can leave stale resources cached for the next
+        * batch. T8132 requires all three bits; the older USC-invalidate bit
+        * alone does not make texture, sampler and depth/stencil reuse coherent.
++       * G15 needs the same barrier: without it a texture the CPU rewrote
++       * between batches samples the previous contents (piglit
++       * teximage-colors, draw-copypixels-sync).
+        */
+       agx_push(out, VDM_BARRIER_G16, cfg) {
+          cfg.unk_0 = true;
+          cfg.unk_1 = true;
+          cfg.unk_4 = true;
+       }
+-   } else {
++   } else if (!apple9_direct) {
+       /* Barrier to enforce GPU-CPU coherency, in case this batch is back to
+        * back with another that caused stale data to be cached and the CPU
+        * wrote to it in the meantime.
+@@ -4299,7 +4409,8 @@ agx_batch_init_state(struct agx_batch *batch)
+ 
+    /* The direct stages use API-ordered raw words, including padded R16F
+     * slots. Four samples use a 32x16 local-memory launch layout. */
+-   if (agx_device(batch->ctx->base.screen)->chip == AGX_CHIP_G16G &&
++   if ((agx_device(batch->ctx->base.screen)->chip == AGX_CHIP_G16G ||
++        agx_device(batch->ctx->base.screen)->g15_graphics) &&
+        agx_apple9_direct_render_enabled(agx_device(batch->ctx->base.screen))) {
+       struct agx_tilebuffer_layout *tib = &batch->tilebuffer_layout;
+       unsigned bytes = 0;
+@@ -6337,6 +6448,95 @@ agx_apple9_upload_compute_textures(struct agx_batch *batch,
+       fprintf(stderr, "APPLE9_COMPUTE_TEXTURES stage=%u masks=%x,%x tables=%llx,%llx abi=%u pubs=%u\n", cs->stage, bindings.texture_mask, bindings.sampler_mask, (unsigned long long)*textures, (unsigned long long)*samplers, cs->apple9_compute_profile.abi, cs->apple9_compute_profile.publication_count);
+ }
+ 
++/* ASAHI_G15_ALLOW: comma-separated G15 draw gates to lift, for hardware
++ * qualification of features the general Apple9 path implements but G15 has
++ * not proven: index, restart, instance, multidraw, prims, scissor, dbias,
++ * fill, blend, colormask, stencil, query, logicop, a2c; or "all". blend
++ * (or all) also admits tile-reading fragment shaders. */
++static bool
++agx_g15_allow(const char *feature)
++{
++   /* Every gated feature passed the desktop-GL qualification with no
++    * baseline loss (G3: 305/617, 78 more than without them), so they are
++    * on by default. ASAHI_G15_ALLOW=none turns them all off; a list enables
++    * only the named ones. */
++   const char *env = getenv("ASAHI_G15_ALLOW");
++   if (!env || !strcmp(env, "all"))
++      return true;
++   if (!strcmp(env, "none"))
++      return false;
++   size_t n = strlen(feature);
++   for (const char *p = env; *p;) {
++      const char *end = strchr(p, ',');
++      size_t len = end ? (size_t)(end - p) : strlen(p);
++      if (len == n && !strncmp(p, feature, n))
++         return true;
++      if (!end)
++         break;
++      p = end + 1;
++   }
++   return false;
++}
++
++/* The bounded G15 bridge profile: returns the first unsupported property of
++ * this draw, or NULL. */
++static const char *
++agx_g15_draw_unsupported(struct agx_context *ctx,
++                         const struct pipe_draw_info *info,
++                         unsigned drawid_offset,
++                         const struct pipe_draw_indirect_info *indirect,
++                         const struct pipe_draw_start_count_bias *draws,
++                         unsigned num_draws)
++{
++   const struct agx_blend_key *blend = &ctx->blend->key;
++#define G15_REJECT(cond) if (cond) return #cond
++   G15_REJECT(num_draws != 1 && !agx_g15_allow("multidraw"));
++   G15_REJECT(indirect);
++   G15_REJECT(info->mode != MESA_PRIM_TRIANGLES &&
++              info->mode != MESA_PRIM_TRIANGLE_STRIP &&
++              info->mode != MESA_PRIM_TRIANGLE_FAN && !agx_g15_allow("prims"));
++   G15_REJECT(info->index_size && !agx_g15_allow("index"));
++   G15_REJECT(info->primitive_restart && !agx_g15_allow("restart"));
++   G15_REJECT(info->instance_count != 1 && !agx_g15_allow("instance"));
++   G15_REJECT(info->start_instance && !agx_g15_allow("instance"));
++   G15_REJECT(draws->count < 3 && !agx_g15_allow("prims"));
++   G15_REJECT(drawid_offset && !agx_g15_allow("multidraw"));
++   /* active_queries is gallium's "queries enabled" flag, true by default;
++    * reject queries that are actually running. */
++   G15_REJECT(ctx->occlusion_query && !agx_g15_allow("query"));
++   for (unsigned i = 0; i < ARRAY_SIZE(ctx->prims_generated); ++i) {
++      G15_REJECT(ctx->prims_generated[i]);
++      G15_REJECT(ctx->tf_prims_generated[i]);
++   }
++   for (unsigned i = 0; i < ARRAY_SIZE(ctx->pipeline_statistics); ++i)
++      G15_REJECT(ctx->pipeline_statistics[i]);
++   G15_REJECT(ctx->time_elapsed);
++   G15_REJECT(ctx->in_tess);
++   G15_REJECT(ctx->stage[MESA_SHADER_GEOMETRY].shader);
++   G15_REJECT(ctx->stage[MESA_SHADER_TESS_CTRL].shader);
++   G15_REJECT(ctx->stage[MESA_SHADER_TESS_EVAL].shader);
++   G15_REJECT(!agx_g15_render_target_supported(&ctx->framebuffer));
++   G15_REJECT(ctx->rast->base.scissor && !agx_g15_allow("scissor"));
++   G15_REJECT(ctx->rast->depth_bias && !agx_g15_allow("dbias"));
++   G15_REJECT(ctx->rast->base.fill_front != PIPE_POLYGON_MODE_FILL &&
++              !agx_g15_allow("fill"));
++   G15_REJECT(ctx->rast->base.fill_back != PIPE_POLYGON_MODE_FILL &&
++              !agx_g15_allow("fill"));
++   G15_REJECT(blend->logicop_enable && !agx_g15_allow("logicop"));
++   G15_REJECT(blend->alpha_to_coverage && !agx_g15_allow("a2c"));
++   G15_REJECT(blend->alpha_to_one);
++   G15_REJECT(blend->rt[0].advanced_blend);
++   G15_REJECT(blend->rt[0].mode != agx_pack_blend_standard(
++      PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
++      PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO) &&
++              !agx_g15_allow("blend"));
++   G15_REJECT(blend->rt[0].colormask != 0xf && !agx_g15_allow("colormask"));
++   G15_REJECT(ctx->zs->base.stencil[0].enabled && !agx_g15_allow("stencil"));
++   G15_REJECT(ctx->zs->base.stencil[1].enabled && !agx_g15_allow("stencil"));
++#undef G15_REJECT
++   return NULL;
++}
++
+ static void
+ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+              unsigned drawid_offset,
+@@ -6347,6 +6547,73 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+    struct agx_device *dev = agx_device(pctx->screen);
+    struct agx_screen *screen = agx_screen(pctx->screen);
+ 
++   if (dev->g15_graphics) {
++      const char *why = agx_g15_draw_unsupported(ctx, info, drawid_offset,
++                                                 indirect, draws, num_draws);
++      if (why) {
++         fprintf(stderr, "G15 graphics accepts one nonindexed opaque triangle only: %s\n",
++                 why);
++         return;
++      }
++      /* A tile whose primitive list outgrows its first allocation stalls
++       * the replayed bridge render (firmware timeout, between 128 and 192
++       * triangles in one tile; the TVB heap path is not qualified). Keep
++       * every render under dev->g15_batch_prims (ASAHI_G15_BATCH_PRIMS): split long triangle lists
++       * and strips, and end the batch before a draw would pass the cap. The
++       * next batch reloads colour and depth. */
++      /* The reload/store helpers' own draws belong to the batch they are
++       * prepared for: never split, flush or count them. */
++      struct agx_batch *capped = agx_get_batch(ctx);
++      unsigned prims = capped->apple9_preparing_tile_helper ? 0 :
++         u_decomposed_prims_for_vertices(info->mode, draws->count);
++      bool split_stencil = capped->key.zsbuf.texture &&
++                           util_format_has_stencil(
++                              util_format_description(capped->key.zsbuf.format)) &&
++                           !agx_g15_stencil_storable(&capped->key);
++      if (prims > dev->g15_batch_prims && num_draws == 1 && !indirect &&
++          !split_stencil &&
++          (info->mode == MESA_PRIM_TRIANGLES ||
++           info->mode == MESA_PRIM_TRIANGLE_STRIP)) {
++         bool list = info->mode == MESA_PRIM_TRIANGLES;
++         unsigned step = list ? 3 * dev->g15_batch_prims : MAX2(dev->g15_batch_prims & ~1u, 2);
++         for (unsigned at = 0; at + 3 <= draws->count; at += step) {
++            struct pipe_draw_start_count_bias part = *draws;
++            part.start = draws->start + at;
++            part.count = MIN2(draws->count - at, list ? step : step + 2);
++            agx_draw_vbo(pctx, info, drawid_offset, NULL, &part, 1);
++         }
++         return;
++      }
++      /* Each primitive list of a tile extends past its first allocation
++       * after roughly 8 primitives when draws stack whole-target layers,
++       * and that extension does not complete on Linux (partial-render
++       * notes): N full-target quads in one render pass at 4 and time out
++       * at 8 (5..7 untested) at every target size. Bound draws per render as well
++       * (ASAHI_G15_BATCH_DRAWS, default 4, 0 = no limit); one draw of many
++       * small triangles stays a single draw. */
++      /* A multidraw recurses through util_draw_multi below, one draw at a
++       * time; only those calls count. */
++      /* Unless it is stored and loaded (ASAHI_G15_STENCIL=1), stencil
++       * lives only in tile memory on G15, so splitting a render with a
++       * stencil attachment loses it: such renders are not capped (they keep
++       * the overflow risk). */
++      bool has_stencil = capped->key.zsbuf.texture &&
++                         util_format_has_stencil(
++                            util_format_description(capped->key.zsbuf.format)) &&
++                         !agx_g15_stencil_storable(&capped->key);
++      if (num_draws == 1 && !has_stencil) {
++         if (prims && capped->apple9_draw_count &&
++             (capped->g15_prims + prims > dev->g15_batch_prims ||
++              (dev->g15_batch_draws &&
++               capped->g15_draws + 1 > dev->g15_batch_draws)))
++            agx_flush_batch_for_reason(ctx, capped, "G15 per-render primitive cap");
++         agx_get_batch(ctx)->g15_prims += prims;
++         agx_get_batch(ctx)->g15_draws += prims ? 1 : 0;
++      } else if (prims) {
++         agx_get_batch(ctx)->g15_uncounted = true;
++      }
++   }
++
+    if (unlikely(!agx_render_condition_check(ctx)))
+       return;
+ 
+@@ -6568,8 +6835,20 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+ #endif
+ 
+    agx_batch_init_state(batch);
+-   if (agx_apple9_direct_render_enabled(dev) && !agx_apple9_reload_color(batch))
++   if (agx_apple9_direct_render_enabled(dev) && !dev->g15_graphics &&
++       !agx_apple9_reload_color(batch))
++      return;
++   /* G15 R7: a batch that keeps its target's contents reloads them with
++    * Mesa's background program instead of the bundle's clear. */
++   if (dev->g15_graphics && !batch->apple9_preparing_tile_helper &&
++       ((batch->load & ~batch->clear & PIPE_CLEAR_COLOR0) || dev->g15_mesa_eot ||
++        dev->g15_mesa_partial || dev->g15_mesa_bg) &&
++       (!agx_apple9_reload_color(batch) || !batch->apple9_color_reload_launch ||
++        ((dev->g15_mesa_eot || dev->g15_mesa_partial) &&
++         !batch->apple9_color_store_launch))) {
++      fprintf(stderr, "G15 colour reload/store program unavailable\n");
+       return;
++   }
+ 
+    /* Dirty track the reduced prim: lines vs points vs triangles. Happens before
+     * agx_update_vs/agx_update_fs, which specialize based on primitive.
+@@ -6859,13 +7138,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+       agx_get_scissor_extents(&ctx->viewport[0],
+                               ctx->rast->base.scissor ? &ctx->scissor[0] : NULL,
+                               &batch->key, &minx, &miny, &maxx, &maxy);
+-      /* Canonicalize empty intersections before unsigned region packing. */
+-      if (minx >= maxx || miny >= maxy)
+-         minx = miny = maxx = maxy = 0;
+-      record->scissor_min[0] = minx;
+-      record->scissor_min[1] = miny;
+-      record->scissor_max[0] = maxx;
+-      record->scissor_max[1] = maxy;
++      /* The SCISSOR descriptor keeps the raw extents: min > max is how the
++       * hardware sees an empty scissor (as agx_upload_viewport_scissor
++       * does). Only the tile-granular region clip needs a canonical,
++       * unsigned-safe empty rectangle.
++       */
++      bool empty = minx >= maxx || miny >= maxy;
++      record->scissor_min[0] = empty ? 0 : minx;
++      record->scissor_min[1] = empty ? 0 : miny;
++      record->scissor_max[0] = empty ? 0 : maxx;
++      record->scissor_max[1] = empty ? 0 : maxy;
+       struct agx_scissor_packed scissor;
+       float minz, maxz;
+       util_viewport_zmin_zmax(&ctx->viewport[0], ctx->rast->base.clip_halfz,
+@@ -6890,6 +7172,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+                 &scissor, sizeof(scissor));
+       }
+       record->reads_tile = pipeline.fragment.reads_tile;
++      /* A fragment shader with memory writes (only the G2 progress
++       * diagnostic is admitted) must run for every covered fragment: ordered
++       * tile access keeps hidden-surface removal from culling earlier
++       * primitives' side effects. */
++      record->reads_tile |= pipeline.fragment.resource_write_mask != 0;
+       record->uses_discard = pipeline.fragment.uses_discard;
+       record->writes_depth = pipeline.fragment.writes_depth;
+       record->disable_tri_merging = pipeline.fragment.disable_tri_merging;
+@@ -6922,7 +7209,20 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+             agx_upload_depth_bias(batch, &ctx->rast->base);
+          }
+       }
+-      record->depth_control = 0x200 | (1u << 16) |
++      /* The native G15 triangle sets bit 18 where T8132 always sets bit 16
++       * (scissor enable, set here only when the scissor is on). */
++      /* G15: bit 18 without a depth buffer (native colour triangle), clear
++       * with one (native D32F captures). */
++      /* Scissor enable is bit 16 on G15 as on G13. It once looked like
++       * "bit 16 rasterizes nothing": the scissor array then still came from
++       * the bundle, all zero. With the command's own array it clips exactly
++       * (gl-1.0-scissor-offscreen, -polygon).
++       */
++      bool g15_scissor = dev->g15_graphics && ctx->rast->base.scissor;
++      record->depth_control = 0x200 |
++                              (!dev->g15_graphics ? (1u << 16) :
++                               batch->key.zsbuf.texture ? 0 : (1u << 18)) |
++                              (g15_scissor ? (1u << 16) : 0) |
+                               (depth_bias_enabled ? (1u << 17) : 0) |
+                               (stencil_enabled ? (3u << 18) : 0);
+       if (ctx->active_queries && ctx->occlusion_query) {
+@@ -7044,6 +7344,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+                                    &batch->apple9_context_pool,
+                                    &pipeline,
+                                    record, previous)) {
++         /* The bounded G15 profile refuses the draw instead. */
++         if (dev->g15_graphics) {
++            fprintf(stderr, "G15 draw state outside the bounded profile\n");
++            return;
++         }
+          fprintf(stderr, "Failed to encode Apple9 draw state\n");
+          abort();
+       }
+@@ -7051,8 +7356,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+       ++batch->apple9_draw_count;
+       pipeline.ppp = record->ppp;
+       pipeline.vertex_launch = record->launch[0] / 0x40;
+-      /* Native vertex launch configuration. It is not a header address. */
++      /* Native vertex launch configuration. It is not a header address.
++       * G2 A/B (ASAHI_G15_VDM_VARY40=1): the native varying hotspot draw
++       * (p1-hotspot x192) sets bit 6; the constant triangle does not. */
+       pipeline.pipeline_word = 0x01000000;
++      {
++         const char *v40 = getenv("ASAHI_G15_VDM_VARY40");
++         if (v40 && ((!strcmp(v40, "1") && pipeline.vertex.varying_components) ||
++                     !strcmp(v40, "2")))
++            pipeline.pipeline_word |= 0x40;
++      }
+       /* Background and EOT dispatch use these fragment entries directly.
+        * A rasterized reload triangle would mark every tile as non-empty,
+        * forcing attachment traffic even where the application draws nothing. */
+@@ -7061,6 +7374,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+          agx_dirty_reset_graphics(ctx);
+          return;
+       }
++      for (unsigned stage = 0; stage < 2; ++stage) {
++         batch->g15_app_program_id[stage] = record->program_id[stage];
++         batch->g15_app_code[stage] = record->code[stage];
++         batch->g15_app_launch[stage] = record->launch[stage];
++      }
+ 
+       /* Keep current at the terminator, so both another draw and a stream
+        * link replace it. A newly linked buffer starts at current directly.
+@@ -7326,6 +7644,10 @@ static void
+ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
+ {
+    struct agx_context *ctx = agx_context(pipe);
++   if (agx_device(pipe->screen)->g15_graphics) {
++      fprintf(stderr, "G15 graphics cannot dispatch compute\n");
++      return;
++   }
+    if (unlikely(!ctx->compute_blitter.active &&
+                 !agx_render_condition_check(ctx)))
+       return;
+diff --git a/src/gallium/drivers/asahi/agx_state.h b/src/gallium/drivers/asahi/agx_state.h
+index 3015c43..88913e9 100644
+--- a/src/gallium/drivers/asahi/agx_state.h
++++ b/src/gallium/drivers/asahi/agx_state.h
+@@ -402,6 +402,10 @@ struct agx_encoder {
+    uint8_t *end;
+ };
+ 
++/* G15: triangles per bridge render. A tile with more than about 128
++ * overlapping triangles stalls the replayed render (see agx_draw_vbo). */
++#define AGX_G15_BATCH_PRIMS 32
++
+ struct agx_batch {
+    struct agx_context *ctx;
+    struct pipe_framebuffer_state key;
+@@ -415,6 +419,7 @@ struct agx_batch {
+    uint32_t clear, draw, load, resolve, feedback;
+    bool initialized;
+    bool apple9_color_reloaded;
++   uint32_t apple9_color_clear_launch;
+    uint32_t apple9_color_reload_launch;
+    uint32_t apple9_color_store_launch;
+    /* Prepare background/EOT state without emitting a rasterized draw. */
+@@ -480,6 +485,18 @@ struct agx_batch {
+    bool apple9_render_initialized;
+    struct agx_pool apple9_context_pool;
+    unsigned apple9_draw_count;
++   /* G15: primitives recorded in this batch (see AGX_G15_BATCH_PRIMS). */
++   unsigned g15_prims;
++   /* G15: draws in this batch (ASAHI_G15_BATCH_DRAWS). */
++   unsigned g15_draws;
++   /* G15: a draw whose primitives the per-render cap does not count
++    * (multi-draw or unsplit stencil). */
++   bool g15_uncounted;
++   /* Identity of the last application draw. Tile-helper preparation also
++    * updates apple9_previous_draw, so it cannot provide this at flush time. */
++   uint64_t g15_app_program_id[2];
++   uint64_t g15_app_code[2];
++   uint32_t g15_app_launch[2];
+    struct agx_apple9_uniform_draw apple9_previous_draw;
+ 
+    /* Apple9 direct records appended to cdm for this command. */
+@@ -509,6 +526,10 @@ struct agx_batch {
+    unsigned cs_preamble_scratch;
+ };
+ 
++bool agx_g15_render_target_supported(const struct pipe_framebuffer_state *fb);
++bool agx_g15_stencil_storable(const struct pipe_framebuffer_state *fb);
++extern uint64_t agx_g15_t_flush;
++
+ struct agx_zsa {
+    struct pipe_depth_stencil_alpha_state base;
+    struct agx_fragment_face_packed depth;
+@@ -643,6 +664,7 @@ struct asahi_blitter {
+ struct agx_oq_heap;
+ 
+ struct agx_context {
++
+    struct pipe_context base;
+    struct agx_compiled_shader *vs, *fs, *gs, *tcs;
+    struct {
+@@ -764,6 +786,9 @@ struct agx_context {
+    struct agx_scratch scratch_vs;
+    struct agx_scratch scratch_fs;
+    struct agx_scratch scratch_cs;
++
++   /* G15 depth-only passes: the scratch colour target (ASAHI_G15_DEPTHONLY). */
++   struct pipe_resource *g15_scratch_rt;
+ };
+ 
+ static inline unsigned
+@@ -1251,6 +1276,8 @@ void agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
+ 
+ void agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info);
+ bool agx_apple9_reload_color(struct agx_batch *batch);
++bool agx_apple9_clear_color(struct agx_batch *batch,
++                            const union pipe_color_union *color);
+ void agx_destroy_color_reload(struct agx_context *ctx);
+ 
+ void agx_resource_copy_region(struct pipe_context *pctx,
+diff --git a/src/gallium/drivers/asahi/meson.build b/src/gallium/drivers/asahi/meson.build
+index fc38706..e6699f9 100644
+--- a/src/gallium/drivers/asahi/meson.build
++++ b/src/gallium/drivers/asahi/meson.build
+@@ -39,9 +39,10 @@ if with_tests
+     'agx_apple9_launcher_tests',
+     executable(
+       'agx_apple9_launcher_tests',
+-      files('test/test-apple9-launch.cpp', 'agx_apple9_launch.c'),
++      files('test/test-apple9-launch.cpp', 'test/test-g15-compute.cpp',
++            'agx_apple9_launch.c'),
+       include_directories : [inc_src],
+-      dependencies : [idep_gtest],
++      dependencies : [idep_gtest, idep_mesautil],
+     ),
+     suite : ['asahi'],
+     protocol : 'gtest',
+diff --git a/src/gallium/drivers/asahi/test/test-apple9-launch.cpp b/src/gallium/drivers/asahi/test/test-apple9-launch.cpp
+index 2d77a4b..8f8508c 100644
+--- a/src/gallium/drivers/asahi/test/test-apple9-launch.cpp
++++ b/src/gallium/drivers/asahi/test/test-apple9-launch.cpp
+@@ -68,6 +68,84 @@ TEST(Apple9Launcher, EntryTargetsCoverCompactArena)
+    }
+ }
+ 
++TEST(Apple9Launcher, G15AbsoluteTargetsCoverFixedUscWindow)
++{
++   auto p = parameters();
++   p.target_format = AGX_APPLE9_LAUNCH_TARGET_G15_ABSOLUTE;
++   for (auto stage : {AGX_APPLE9_LAUNCH_VERTEX, AGX_APPLE9_LAUNCH_FRAGMENT,
++                     AGX_APPLE9_LAUNCH_COMPUTE}) {
++      for (uint32_t offset : {0u, 0x40u, 0x100u, 0x1c0u, 0x10000200u,
++                              0xfffffe00u, 0xffffffc0u}) {
++         p.entry_offset = offset;
++         std::array<uint8_t, 1024> out;
++         ASSERT_TRUE(agx_apple9_launch_build(out.data(), out.size(), stage, &p));
++         unsigned at = agx_apple9_launch_call_offset(stage, p.resource_count) - 2;
++         EXPECT_EQ(read16(out.data() + at), 0x177u);
++         EXPECT_EQ(out[at + 2] & 0x7f, 0x2a);
++         uint64_t address = 0;
++         for (unsigned byte = 0; byte < 5; ++byte)
++            address |= uint64_t(out[at + 3 + byte]) << (7 + 8 * byte);
++         address |= uint64_t(out[at + 2] >> 7) << 6;
++         EXPECT_EQ(address, p.shader_base + offset);
++         EXPECT_EQ(out[at + 8], stage == AGX_APPLE9_LAUNCH_VERTEX ? 0 : 4);
++         EXPECT_EQ(out[at + 9], 0);
++         EXPECT_EQ(out.back(), 0);
++      }
++   }
++}
++
++TEST(Apple9Launcher, TargetFormatChangesOnlyTheTargetInstruction)
++{
++   auto p = parameters();
++   p.preamble_address = p.shader_base + 0x10000;
++   p.launch_address = p.shader_base + 0x204000;
++   for (auto stage : {AGX_APPLE9_LAUNCH_VERTEX, AGX_APPLE9_LAUNCH_FRAGMENT,
++                     AGX_APPLE9_LAUNCH_COMPUTE}) {
++      std::array<uint8_t, 1024> compact, explicit_compact, absolute;
++      p.target_format = AGX_APPLE9_LAUNCH_TARGET_COMPACT;
++      ASSERT_TRUE(agx_apple9_launch_build(compact.data(), compact.size(), stage, &p));
++      auto default_params = p;
++      default_params.target_format = {};
++      ASSERT_TRUE(agx_apple9_launch_build(explicit_compact.data(),
++                                        explicit_compact.size(), stage, &default_params));
++      EXPECT_EQ(compact, explicit_compact);
++      p.target_format = AGX_APPLE9_LAUNCH_TARGET_G15_ABSOLUTE;
++      ASSERT_TRUE(agx_apple9_launch_build(absolute.data(), absolute.size(), stage, &p));
++      unsigned at = agx_apple9_launch_call_offset(stage, p.resource_count) - 2;
++      memcpy(absolute.data() + at, compact.data() + at, 10);
++      EXPECT_EQ(absolute, compact);
++   }
++}
++
++TEST(Apple9Launcher, InvalidG15TargetsCannotPublishPartialCode)
++{
++   auto p = parameters();
++   p.target_format = AGX_APPLE9_LAUNCH_TARGET_G15_ABSOLUTE;
++   auto reject = [&](agx_apple9_launch_parameters bad) {
++      for (auto stage : {AGX_APPLE9_LAUNCH_VERTEX, AGX_APPLE9_LAUNCH_FRAGMENT,
++                        AGX_APPLE9_LAUNCH_COMPUTE}) {
++         std::array<uint8_t, 1024> out;
++         out.fill(0xa5);
++         const auto saved = out;
++         EXPECT_FALSE(agx_apple9_launch_build(out.data(), out.size(), stage, &bad));
++         EXPECT_EQ(out, saved);
++      }
++   };
++   for (uint32_t offset : {1u, 2u, 63u, 65u, UINT32_MAX}) {
++      auto bad = p;
++      bad.entry_offset = offset;
++      reject(bad);
++   }
++   for (uint64_t base : {UINT64_C(0), p.shader_base - 64, p.shader_base + 64,
++                         p.shader_base + UINT64_C(0x100000000), UINT64_MAX}) {
++      auto bad = p;
++      bad.shader_base = base;
++      reject(bad);
++   }
++   p.target_format = static_cast<agx_apple9_launch_target_format>(2);
++   reject(p);
++}
++
+ TEST(Apple9Launcher, ResourceCountsRespectAllocationBounds)
+ {
+    auto p = parameters();
+diff --git a/src/gallium/drivers/asahi/test/test-g15-compute.cpp b/src/gallium/drivers/asahi/test/test-g15-compute.cpp
+new file mode 100644
+index 0000000..24f0c88
+--- /dev/null
++++ b/src/gallium/drivers/asahi/test/test-g15-compute.cpp
+@@ -0,0 +1,262 @@
++/* Copyright 2026 Brian Williams
++ * SPDX-License-Identifier: MIT
++ */
++#include <cstring>
++#include "gtest/gtest.h"
++extern "C" {
++#include "asahi/lib/agx_g15_compute.h"
++#include "asahi/lib/agx_g15_graphics.h"
++#include "util/vma.h"
++}
++
++static drm_asahi_params_global
++g15_params()
++{
++   drm_asahi_params_global p = {};
++   p.gpu_generation = 15;
++   p.features = DRM_ASAHI_FEATURE_SOFT_FAULTS;
++   p.max_commands_per_submission = 1;
++   p.usc_window_start = AGX_G15_USC_USER_MIN;
++   p.usc_window_end = AGX_G15_USC_END;
++   return p;
++}
++
++TEST(G15Compute, LegacyParamsPrefixPreservesOtherDevices)
++{
++   static_assert(offsetof(drm_asahi_params_global, usc_window_start) == 592);
++   static_assert(sizeof(drm_asahi_params_global) == 624);
++   static_assert(offsetof(drm_asahi_params_global, render_context_start) == 608);
++   for (unsigned generation : {13, 14, 16, 17}) {
++      auto p = g15_params();
++      p.gpu_generation = generation;
++      p.features = UINT64_MAX; /* Existing non-G15 feature policy is unchanged. */
++      p.usc_window_start = p.usc_window_end = 0;
++      drm_asahi_params_global reply = {};
++      memcpy(&reply, &p, 592); /* An actual legacy-sized reply, zero-filled tail. */
++      EXPECT_EQ(reply.usc_window_start, 0u);
++      EXPECT_EQ(reply.usc_window_end, 0u);
++      for (bool requested : {false, true}) {
++         bool selected = true;
++         EXPECT_TRUE(agx_g15_compute_select(&reply, 592, requested, false, &selected));
++         EXPECT_FALSE(selected);
++         EXPECT_FALSE(agx_g15_compute_select(&p, 591, requested, false, &selected));
++      }
++   }
++}
++
++TEST(G15Compute, OptInRequiresCompleteKnownNativeContract)
++{
++   auto p = g15_params();
++   bool selected = false;
++   ASSERT_TRUE(agx_g15_compute_select(&p, 608, true, false, &selected));
++   EXPECT_TRUE(selected);
++   for (size_t size : {size_t(0), size_t(592), size_t(600), size_t(607)})
++      EXPECT_FALSE(agx_g15_compute_select(&p, size, true, false, &selected));
++   EXPECT_FALSE(agx_g15_compute_select(&p, 608, false, false, &selected));
++   EXPECT_FALSE(agx_g15_compute_select(&p, 608, true, true, &selected));
++   p.max_attachments = 1;
++   EXPECT_FALSE(agx_g15_compute_select(&p, 608, true, false, &selected));
++   p.max_attachments = 0;
++   p.max_commands_per_submission = 2;
++   EXPECT_FALSE(agx_g15_compute_select(&p, 608, true, false, &selected));
++   p.max_commands_per_submission = 1;
++   for (uint64_t features : {UINT64_C(0), UINT64_C(3), UINT64_MAX}) {
++      p.features = features;
++      EXPECT_FALSE(agx_g15_compute_select(&p, 608, true, false, &selected));
++      EXPECT_FALSE(selected);
++   }
++}
++
++TEST(G15Compute, BadOrExhaustedWindowRejectsSelection)
++{
++   auto reject = [](uint64_t start, uint64_t end) {
++      auto p = g15_params();
++      p.usc_window_start = start;
++      p.usc_window_end = end;
++      bool selected = true;
++      EXPECT_FALSE(agx_g15_compute_select(&p, 608, true, false, &selected));
++      EXPECT_FALSE(selected);
++   };
++   reject(0, 0);
++   reject(AGX_G15_USC_USER_MIN - AGX_G15_PAGE_SIZE, AGX_G15_USC_END);
++   reject(AGX_G15_USC_USER_MIN + AGX_G15_PAGE_SIZE, AGX_G15_USC_END);
++   reject(AGX_G15_USC_USER_MIN, AGX_G15_USC_END + AGX_G15_PAGE_SIZE);
++   reject(AGX_G15_USC_USER_MIN, AGX_G15_USC_END - 1);
++   reject(AGX_G15_USC_END, AGX_G15_USC_USER_MIN);
++   reject(AGX_G15_USC_USER_MIN, AGX_G15_USC_USER_MIN);
++   reject(AGX_G15_USC_USER_MIN,
++          AGX_G15_USC_USER_MIN + AGX_APPLE9_ENTRY_ARENA_SIZE);
++}
++
++TEST(G15Compute, RealVmaArenaGuardAndLocalFreeRemainBounded)
++{
++   util_vma_heap usc, entries;
++   const uint64_t reserved = AGX_APPLE9_ENTRY_ARENA_SIZE + AGX_G15_PAGE_SIZE;
++   util_vma_heap_init(&usc, AGX_G15_USC_USER_MIN, reserved);
++   usc.alloc_high = false;
++   uint64_t arena = util_vma_heap_alloc(&usc, reserved, AGX_APPLE9_ENTRY_ARENA_SIZE);
++   ASSERT_EQ(arena, AGX_G15_USC_USER_MIN);
++   EXPECT_EQ(util_vma_heap_alloc(&usc, AGX_G15_PAGE_SIZE, AGX_G15_PAGE_SIZE), 0u);
++   util_vma_heap_init(&entries, AGX_APPLE9_ENTRY_HEADER_SIZE,
++                      AGX_APPLE9_ENTRY_ARENA_SIZE - AGX_APPLE9_ENTRY_HEADER_SIZE);
++   entries.alloc_high = false;
++   uint32_t block = util_vma_heap_alloc(&entries, AGX_APPLE9_ENTRY_BLOCK_SIZE, 64);
++   ASSERT_EQ(block, 0x340u);
++   uint32_t local = block + AGX_APPLE9_ENTRY_CODE_OFFSET, target = 0;
++   ASSERT_TRUE(agx_apple9_entry_target_offset(AGX_G15_USC_BASE, arena, local, &target));
++   EXPECT_EQ(target, 0x100003c0u);
++   util_vma_heap_free(&entries, local - AGX_APPLE9_ENTRY_CODE_OFFSET,
++                      AGX_APPLE9_ENTRY_BLOCK_SIZE);
++   EXPECT_EQ(util_vma_heap_alloc(&entries, AGX_APPLE9_ENTRY_BLOCK_SIZE, 64), block);
++   util_vma_heap_finish(&entries);
++   util_vma_heap_free(&usc, arena, reserved);
++   EXPECT_EQ(util_vma_heap_alloc(&usc, reserved, AGX_APPLE9_ENTRY_ARENA_SIZE), arena);
++   util_vma_heap_finish(&usc);
++}
++
++TEST(G15Compute, EntryConversionPreservesCompactAndRejectsWithoutWriting)
++{
++   uint32_t target = 0;
++   ASSERT_TRUE(agx_apple9_entry_target_offset(AGX_G15_USC_BASE, AGX_G15_USC_BASE,
++                                             0x3c0, &target));
++   EXPECT_EQ(target, 0x3c0u);
++   for (auto arena : {AGX_G15_USC_BASE - 64, AGX_G15_USC_BASE + 1,
++                      AGX_G15_USC_END, UINT64_MAX - 63}) {
++      target = 0xface;
++      EXPECT_FALSE(agx_apple9_entry_target_offset(AGX_G15_USC_BASE, arena, 0x3c0, &target));
++      EXPECT_EQ(target, 0xfaceu);
++   }
++   for (uint32_t local : {1u, 63u, AGX_APPLE9_ENTRY_ARENA_SIZE}) {
++      target = 0xface;
++      EXPECT_FALSE(agx_apple9_entry_target_offset(AGX_G15_USC_BASE,
++                                                 AGX_G15_USC_USER_MIN, local, &target));
++      EXPECT_EQ(target, 0xfaceu);
++   }
++}
++
++TEST(G15Compute, FirstProfileRejectsUnqualifiedResourceAndHelperClasses)
++{
++   agx_apple9_compute_profile p = {};
++   p.abi = AGX_APPLE9_COMPUTE_ABI_DIRECT_BUFFERS;
++   p.resource_binding_count = 1;
++   p.resource_kind[0] = AGX_APPLE9_COMPUTE_RESOURCE_SSBO;
++   p.resource_write_mask = 1;
++   /* The authored write1337 compiler result has SSBO write_mask=1 and
++    * writes_global=false; the latter describes raw global stores. */
++   p.writes_global = false;
++   p.local_size[0] = p.local_size[1] = p.local_size[2] = 1;
++   ASSERT_TRUE(agx_g15_compute_shader_supported(&p));
++   p.resource_read_mask = 1;
++   EXPECT_TRUE(agx_g15_compute_shader_supported(&p));
++   auto good = p;
++   for (unsigned field = 0; field < 13; ++field) {
++      p = good;
++      switch (field) {
++      case 0: p.abi = AGX_APPLE9_COMPUTE_ABI_DESCRIPTOR_TABLES; break;
++      case 1: p.resource_binding_count = 2; break;
++      case 2: p.resource_binding[0] = 1; break;
++      case 3: p.resource_kind[0] = AGX_APPLE9_COMPUTE_RESOURCE_UBO; break;
++      case 4: p.resource_read_mask = 2; break;
++      case 5: p.resource_write_mask = 0; break;
++      case 6: p.variable_local_size = true; break;
++      case 7: p.local_size[0] = 2; break;
++      case 8: p.required_threadgroup_memory_bytes = 128; break;
++      case 9: p.scratch_size = 16; break;
++      case 10: p.preamble_size = 2; break;
++      case 11: p.atomic_frame_size = 4; break;
++      case 12: p.writes_global = true; break;
++      }
++      EXPECT_FALSE(agx_g15_compute_shader_supported(&p));
++   }
++}
++
++static drm_asahi_params_global
++g15_graphics_params()
++{
++   auto p = g15_params();
++   p.vm_start = AGX_G15_CONTEXT_BASE;
++   p.vm_end = UINT64_C(0x6000000000);
++   p.render_context_start = AGX_G15_CONTEXT_USER_MIN;
++   p.render_context_end = AGX_G15_CONTEXT_END;
++   return p;
++}
++
++TEST(G15Graphics, RequiresExplicitModeAndActual624ByteTail)
++{
++   auto p = g15_graphics_params();
++   bool selected = false;
++   ASSERT_TRUE(agx_g15_graphics_select(&p, sizeof(p), true, false, false, &selected));
++   ASSERT_TRUE(selected);
++   EXPECT_FALSE(agx_g15_graphics_select(&p, sizeof(p), true, true, false, &selected));
++   EXPECT_FALSE(selected);
++   EXPECT_FALSE(agx_g15_graphics_select(&p, sizeof(p), true, false, true, &selected));
++   for (size_t size : {size_t(592), size_t(608), size_t(616), size_t(623)})
++      EXPECT_FALSE(agx_g15_graphics_select(&p, size, true, false, false, &selected));
++   drm_asahi_params_global old_reply = {};
++   memcpy(&old_reply, &p, 608);
++   /* GET_PARAMS leaves requested size unchanged: zero tail must fail. */
++   EXPECT_FALSE(agx_g15_graphics_select(&old_reply, 624, true, false, false, &selected));
++   EXPECT_FALSE(selected);
++   EXPECT_TRUE(agx_g15_compute_select(&old_reply, 608, true, false, &selected));
++   EXPECT_TRUE(selected);
++   EXPECT_TRUE(agx_g15_graphics_select(&old_reply, 608, false, true, false, &selected));
++   EXPECT_FALSE(selected);
++   for (unsigned gen : {13, 14, 16, 17}) {
++      p.gpu_generation = gen;
++      EXPECT_TRUE(agx_g15_graphics_select(&p, 592, true, false, false, &selected));
++      EXPECT_FALSE(selected);
++   }
++}
++
++TEST(G15Graphics, RejectsBadContextAndInheritedComputeContracts)
++{
++   auto good = g15_graphics_params();
++   for (unsigned field = 0; field < 11; ++field) {
++      auto p = good;
++      switch (field) {
++      case 0: p.render_context_start = 0; break;
++      case 1: p.render_context_start -= AGX_G15_PAGE_SIZE; break;
++      case 2: p.render_context_end += AGX_G15_PAGE_SIZE; break;
++      case 3: p.render_context_start += 1; break;
++      case 4: p.render_context_end -= 1; break;
++      case 5: p.render_context_end = p.render_context_start; break;
++      case 6: p.render_context_end = p.render_context_start + AGX_G15_PAGE_SIZE; break;
++      case 7: p.vm_start = p.render_context_start + AGX_G15_PAGE_SIZE; break;
++      case 8: p.vm_end = p.render_context_end - AGX_G15_PAGE_SIZE; break;
++      case 9: p.features = UINT64_MAX; break;
++      case 10: p.max_commands_per_submission = 2; break;
++      }
++      bool selected = true;
++      EXPECT_FALSE(agx_g15_graphics_select(&p, 624, true, false, false, &selected));
++      EXPECT_FALSE(selected);
++   }
++}
++
++TEST(G15Graphics, LinearRgba8TargetsUpTo256AreAdmitted)
++{
++   auto check = [](unsigned w, unsigned h, unsigned layers, unsigned samples,
++                   unsigned level, unsigned first, unsigned last, uint64_t stride,
++                   uint64_t size, bool rgba8, bool linear) {
++      return agx_g15_graphics_target_supported(w, h, layers, samples, level,
++                                              first, last, stride, size, rgba8, linear);
++   };
++   ASSERT_TRUE(check(128,128,1,1,0,0,0,512,65536,true,true));
++   EXPECT_TRUE(check(160,160,1,1,0,0,0,640,102400,true,true));
++   EXPECT_TRUE(check(256,256,1,1,0,0,0,1024,262144,true,true));
++   EXPECT_TRUE(check(200,120,1,1,0,0,0,896,107520,true,true));
++   EXPECT_TRUE(check(1,1,1,1,0,0,0,128,128,true,true));
++   EXPECT_FALSE(check(200,120,1,1,0,0,0,800,96000,true,true));
++   EXPECT_FALSE(check(257,128,1,1,0,0,0,1152,147456,true,true));
++   EXPECT_FALSE(check(128,257,1,1,0,0,0,512,131584,true,true));
++   EXPECT_FALSE(check(0,128,1,1,0,0,0,0,0,true,true));
++   EXPECT_FALSE(check(128,128,2,1,0,0,0,512,65536,true,true));
++   EXPECT_FALSE(check(128,128,1,2,0,0,0,512,65536,true,true));
++   EXPECT_FALSE(check(128,128,1,1,1,0,0,512,65536,true,true));
++   /* A level above 0 only for GPU-tiled targets (no linear stride). */
++   EXPECT_TRUE(check(64,64,1,1,1,0,0,0,0,true,false));
++   EXPECT_FALSE(check(128,128,1,1,0,1,1,512,65536,true,true));
++   EXPECT_FALSE(check(128,128,1,1,0,0,0,1024,65536,true,true));
++   EXPECT_FALSE(check(128,128,1,1,0,0,0,512,65535,true,true));
++   EXPECT_FALSE(check(128,128,1,1,0,0,0,512,65536,false,true));
++   EXPECT_FALSE(check(128,128,1,1,0,0,0,512,65536,true,false));
++}

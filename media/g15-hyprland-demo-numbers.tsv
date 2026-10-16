@@ -1,0 +1,13 @@
+client_driver	compositor_driver	workload	result
+g15	g15	simple-egl	56.799999 fps
+g15	g15	simple-egl	60.599998 fps
+g15	g15	glmark	[texture] texture-filter=linear: FPS: 113 FrameTime: 8.908 ms
+g15	g15	glmark	[shading] shading=gouraud: FPS: 2 FrameTime: 615.866 ms
+g15	g15	glmark validate	[texture] texture-filter=linear: Validation: Success
+g15	g15	glmark validate	[shading] shading=gouraud: Validation: Success
+llvmpipe	g15	simple-egl	59.000000 fps
+llvmpipe	g15	simple-egl	60.200001 fps
+llvmpipe	g15	glmark	[texture] texture-filter=linear: FPS: 112 FrameTime: 8.968 ms
+llvmpipe	g15	glmark	[shading] shading=gouraud: FPS: 95 FrameTime: 10.560 ms
+llvmpipe	g15	glmark validate	[texture] texture-filter=linear: Validation: Success
+llvmpipe	g15	glmark validate	[shading] shading=gouraud: Validation: Success
