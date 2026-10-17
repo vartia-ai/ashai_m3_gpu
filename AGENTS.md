@@ -109,6 +109,11 @@ section 1 failed: `sudo dmesg | grep g15_dt_overlay` says which.
 
 ## 6. Build Mesa and test rendering
 
+> Not yet verified on a fresh install: the project's Mesa was cross-built, and
+> these native build steps have not been run end to end on the laptop yet.
+> If meson reports a missing dependency or option, report it rather than
+> working around it with different options.
+
 ```
 git clone https://github.com/GravityLinux/mesa.git ~/g15-mesa-src
 cd ~/g15-mesa-src
