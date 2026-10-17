@@ -1246,11 +1246,11 @@ index ec7ff77..1340055 100644
     const uint32_t **libagx_programs;
 diff --git a/src/asahi/lib/agx_g15_compute.h b/src/asahi/lib/agx_g15_compute.h
 new file mode 100644
-index 0000000..a58fae3
+index 0000000..c3a7f2c
 --- /dev/null
 +++ b/src/asahi/lib/agx_g15_compute.h
 @@ -0,0 +1,79 @@
-+/* Copyright 2026 Brian Williams
++/* Copyright 2026 Vartia LLC
 + * SPDX-License-Identifier: MIT
 + */
 +#ifndef AGX_G15_COMPUTE_H
@@ -1331,11 +1331,11 @@ index 0000000..a58fae3
 +#endif
 diff --git a/src/asahi/lib/agx_g15_graphics.h b/src/asahi/lib/agx_g15_graphics.h
 new file mode 100644
-index 0000000..8be4e06
+index 0000000..9bf6014
 --- /dev/null
 +++ b/src/asahi/lib/agx_g15_graphics.h
 @@ -0,0 +1,85 @@
-+/* Copyright 2026 Brian Williams
++/* Copyright 2026 Vartia LLC
 + * SPDX-License-Identifier: MIT
 + */
 +#ifndef AGX_G15_GRAPHICS_H
@@ -2296,11 +2296,11 @@ index ba286d6..1753a4b 100644
                           unsigned dst_samples,
 diff --git a/src/gallium/drivers/asahi/agx_g15_graphics_nir.h b/src/gallium/drivers/asahi/agx_g15_graphics_nir.h
 new file mode 100644
-index 0000000..594c26d
+index 0000000..4d40c5c
 --- /dev/null
 +++ b/src/gallium/drivers/asahi/agx_g15_graphics_nir.h
 @@ -0,0 +1,29 @@
-+/* Copyright 2026 Brian Williams
++/* Copyright 2026 Vartia LLC
 + * SPDX-License-Identifier: MIT
 + */
 +#ifndef AGX_G15_GRAPHICS_NIR_H
@@ -3684,11 +3684,11 @@ index 2d77a4b..8f8508c 100644
     auto p = parameters();
 diff --git a/src/gallium/drivers/asahi/test/test-g15-compute.cpp b/src/gallium/drivers/asahi/test/test-g15-compute.cpp
 new file mode 100644
-index 0000000..24f0c88
+index 0000000..5097b6f
 --- /dev/null
 +++ b/src/gallium/drivers/asahi/test/test-g15-compute.cpp
 @@ -0,0 +1,262 @@
-+/* Copyright 2026 Brian Williams
++/* Copyright 2026 Vartia LLC
 + * SPDX-License-Identifier: MIT
 + */
 +#include <cstring>
