@@ -109,10 +109,18 @@ section 1 failed: `sudo dmesg | grep g15_dt_overlay` says which.
 
 ## 6. Build Mesa and test rendering
 
-> Not yet verified on a fresh install: the project's Mesa was cross-built, and
-> these native build steps have not been run end to end on the laptop yet.
-> If meson reports a missing dependency or option, report it rather than
-> working around it with different options.
+Install Mesa's build dependencies first. These steps were run end to end on
+the project's laptop (up-to-date Omarchy, LLVM 23), where the first six
+packages were missing; a fresh install may lack others too:
+
+```
+sudo pacman -S --needed meson ninja python-mako python-pycparser libclc \
+    spirv-llvm-translator clang llvm libdrm wayland wayland-protocols \
+    libglvnd glslang spirv-tools bison flex python-packaging python-yaml
+```
+
+If meson still reports a missing dependency or option, report it rather
+than working around it with different options.
 
 ```
 git clone https://github.com/GravityLinux/mesa.git ~/g15-mesa-src
@@ -129,10 +137,6 @@ cat > ~/g15-mesa/50_g15_mesa.json <<EOF
 {"file_format_version": "1.0.0", "ICD": {"library_path": "$HOME/g15-mesa/lib/libEGL_mesa.so.0"}}
 EOF
 ```
-
-Mesa's own build dependencies apply (`meson ninja python-mako libdrm
-wayland wayland-protocols llvm clang libclc spirv-llvm-translator`, and so
-on); meson names anything missing.
 
 Test with the client in `tools/gl-test` (needs the driver loaded):
 
