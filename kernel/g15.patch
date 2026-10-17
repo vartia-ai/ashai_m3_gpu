@@ -12765,10 +12765,10 @@ index b86bd3ff3..89cdb26b5 100644
      pub(crate) _buffer: Arc<dyn core::any::Any + Send + Sync>,
 diff --git a/drivers/gpu/drm/asahi/g15_builtin_profile.rs b/drivers/gpu/drm/asahi/g15_builtin_profile.rs
 new file mode 100644
-index 000000000..48cf67f85
+index 000000000..7c3b11671
 --- /dev/null
 +++ b/drivers/gpu/drm/asahi/g15_builtin_profile.rs
-@@ -0,0 +1,3147 @@
+@@ -0,0 +1,3158 @@
 +// SPDX-License-Identifier: GPL-2.0-only OR MIT
 +// Provenance: the values in this file were observed on one MacBook Air 13" M3
 +// (J613, T8122, GPU G15G) running the macOS 14.7 GPU firmware, in captures of
@@ -12812,7 +12812,7 @@ index 000000000..48cf67f85
 +/// Header flags: none.
 +const FLAGS: u32 = 0;
 +/// Serialized size; [`g15_builtin_kprofile`] checks it.
-+const BLOB_BYTES: usize = 23312;
++const BLOB_BYTES: usize = 23512;
 +const RECORD_COUNT: usize = 59;
 +
 +/// The W3 `G15Prov` of one register or template patch.
@@ -13094,9 +13094,10 @@ index 000000000..48cf67f85
 +const NM_FRAGMENT_SKU: u16 = 27;
 +const NM_STAMP_TA: u16 = 28;
 +const NM_STAMP_FRAG: u16 = 29;
++const NM_PB_SLOT: u16 = 30;
 +
 +/// NAMES record: derived (profile schema; identifies typed live producers).
-+const NAMES: [&str; 30] = [
++const NAMES: [&str; 31] = [
 +    "tvb_tilemap",
 +    "tpc",
 +    "tvb_heapmeta",
@@ -13127,6 +13128,9 @@ index 000000000..48cf67f85
 +    "fragment_sku",
 +    "stamp_ta",
 +    "stamp_frag",
++    // Added after generation (Codex FW-RAM cross-OS diff, 2026-10-17): the
++    // SKU mirrors of the job's PB slot and context below.
++    "pb_slot",
 +];
 +
 +/// STATUS: derived (parser/publication authorization only,
@@ -13665,7 +13669,7 @@ index 000000000..48cf67f85
 +/// TA SKU template patches (offset, width, native, provenance);
 +/// each is rewritten live from its provenance.
 +#[rustfmt::skip]
-+const TA_SKU_PATCHES: [Patch; 38] = [
++const TA_SKU_PATCHES: [Patch; 39] = [
 +    patch(0x14, 8, 0xffff_fc20_0c02_0040, rfull(NM_TA_COMMAND, 0x40)),
 +    patch(0x1c, 8, 0xffff_fc20_0c50_0000, rfull(NM_BUFFER_INFO, 0)),
 +    patch(0x24, 8, 0xffff_fc20_0c4f_8080, rfull(NM_PM_RECORD, 0)),
@@ -13673,6 +13677,8 @@ index 000000000..48cf67f85
 +    patch(0x34, 8, 0xffff_fc20_0c00_0000, rfull(NM_CHANNEL_STATE_TA, 0)),
 +    patch(0x3c, 8, 0xffff_fc20_0c02_084c, rfull(NM_TA_COMMAND, 0x84c)),
 +    patch(0x44, 4, 1, dscalar(NM_CONTEXT_ID, 0, u64::MAX, 0)),
++    // StartTA buffer-manager slot: the job's PB slot (native x192: 4).
++    patch(0x50, 4, 0, dscalar(NM_PB_SLOT, 0, u64::MAX, 0)),
 +    patch(0x64, 8, 0xffff_fc20_0c02_0784, rfull(NM_TA_COMMAND, 0x784)),
 +    patch(0x6c, 8, 0xffff_fc20_0c02_0890, rfull(NM_TA_COMMAND, 0x890)),
 +    patch(0x7c, 4, 0x100_003a, dscalar(NM_UUID_TA, 0, u64::MAX, 0)),
@@ -13929,7 +13935,7 @@ index 000000000..48cf67f85
 +/// 3D SKU template patches (offset, width, native, provenance);
 +/// each is rewritten live from its provenance.
 +#[rustfmt::skip]
-+const FRAG_SKU_PATCHES: [Patch; 42] = [
++const FRAG_SKU_PATCHES: [Patch; 44] = [
 +    patch(0x14, 8, 0xffff_fc20_0c0b_0080, rfull(NM_FRAGMENT_COMMAND, 0x80)),
 +    patch(0x1c, 8, 0xffff_fc20_0c4f_8080, rfull(NM_PM_RECORD, 0)),
 +    patch(0x24, 8, 0xffff_fc20_0c4a_a4c8, rfull(NM_STATS_FRAG, 8)),
@@ -13939,6 +13945,8 @@ index 000000000..48cf67f85
 +    patch(0x44, 8, 0xffff_fc20_0c00_24c0, rfull(NM_CHANNEL_STATE_FRAG, 0)),
 +    patch(0x4c, 8, 0xffff_fc20_0c0b_0000, rfull(NM_FRAGMENT_COMMAND, 0)),
 +    patch(0x54, 4, 1, dscalar(NM_CONTEXT_ID, 0, u64::MAX, 0)),
++    // Start3D buffer-manager slot: the job's PB slot (native x192: 4).
++    patch(0x60, 4, 0, dscalar(NM_PB_SLOT, 0, u64::MAX, 0)),
 +    patch(0x74, 8, 0xffff_fc20_0c0b_0a58, rfull(NM_FRAGMENT_COMMAND, 0xa58)),
 +    patch(0x7c, 8, 0xffff_fc20_0c0b_0bd8, rfull(NM_FRAGMENT_COMMAND, 0xbd8)),
 +    patch(0x98, 4, 0x100_0039, dscalar(NM_UUID_FRAG, 0, u64::MAX, 0)),
@@ -13969,6 +13977,9 @@ index 000000000..48cf67f85
 +    patch(0x29c, 8, 0xffff_fc20_0c0b_0b70, rfull(NM_FRAGMENT_COMMAND, 0xb70)),
 +    patch(0x2a4, 8, 0xffff_fc20_0c00_24c0, rfull(NM_CHANNEL_STATE_FRAG, 0)),
 +    patch(0x2ac, 8, 0xffff_fc20_0c0b_0000, rfull(NM_FRAGMENT_COMMAND, 0)),
++    // Finalize3D context ID (V14.7 opcode-8 handler reads its low 6 bits;
++    // native x192: 3). Was copied as the capture's constant 1.
++    patch(0x2b4, 4, 1, dscalar(NM_CONTEXT_ID, 0, u64::MAX, 0)),
 +    patch(0x2bc, 8, 0xffff_fc20_0c0b_0a58, rfull(NM_FRAGMENT_COMMAND, 0xa58)),
 +    patch(0x2f4, 8, 0xffff_fc20_0c3a_81a4, rfull(NM_FRAGMENT_SKU, 0x1a4)),
 +    patch(0x304, 8, 0xffff_fc20_0c0b_0c40, rfull(NM_FRAGMENT_COMMAND, 0xc40)),
