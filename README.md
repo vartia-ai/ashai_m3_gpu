@@ -1,5 +1,14 @@
 # Linux GPU rendering on the Apple M3 (G15)
 
+> [!WARNING]
+> **Not ready for use yet.** This is an early research release. It documents
+> how the M3 GPU works and shows a working demo, but you cannot install it on
+> your Mac from here yet: the kernel driver is not published, there are no
+> prebuilt packages or install instructions, and it has only been tested on one
+> MacBook Air 13" M3 (J613) with macOS 14.7 system firmware. Expect hangs that
+> need a reboot, slow mesh-heavy apps, and no support. This notice will be
+> removed once there is something people can install and use.
+
 A working GPU-accelerated Linux desktop on a MacBook Air M3 (J613, T8122,
 GPU G15G, firmware 14.7): Hyprland and GL/GLES clients rendered by the M3 GPU
 through Mesa, using a G15 port of the Asahi AGX kernel driver.
