@@ -1,0 +1,31 @@
+From 71386f7b998808acff333ae4722f80256ec9fbfa Mon Sep 17 00:00:00 2001
+From: Ramzi Abdiche <abdicheramzi@gmail.com>
+Date: Mon, 7 Sep 2026 23:45:49 +0200
+Subject: [PATCH 8/9] drm: apple: Correct DCP 14.7 tiling callbacks
+
+Dispatch get_tiling_state and set_tiling_state at callback indices 115
+and 116.
+
+Signed-off-by: Ramzi Abdiche <abdicheramzi@gmail.com>
+---
+ drivers/gpu/drm/apple/iomfb_v14_7.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_v14_7.c b/drivers/gpu/drm/apple/iomfb_v14_7.c
+index 19f38cb03..ceee1c1a4 100644
+--- a/drivers/gpu/drm/apple/iomfb_v14_7.c
++++ b/drivers/gpu/drm/apple/iomfb_v14_7.c
+@@ -58,8 +58,8 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
+ 	[111] = trampoline_true, /* create_iomfb_service */
+ 	[112] = trampoline_create_backlight_service,
+ 	[113] = trampoline_true, /* create_nvram_service? */
+-	//[114] = trampoline_get_tiling_state,
+-	//[115] = trampoline_false, /* set_tiling_state */
++	[115] = trampoline_get_tiling_state,
++	[116] = trampoline_false, /* set_tiling_state */
+ 	[121] = dcpep_cb_boot_1, /* is_dark_boot */
+ 	[122] = trampoline_false, /* is_dark_boot / is_waking_from_hibernate*/
+ 	[123] = trampoline_false,
+-- 
+2.56.0
+

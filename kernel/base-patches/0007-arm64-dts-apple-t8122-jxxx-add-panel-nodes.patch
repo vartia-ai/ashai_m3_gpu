@@ -1,0 +1,88 @@
+From 47e403e998e61252707b8fd89ffc9eca67bc3ba1 Mon Sep 17 00:00:00 2001
+From: sofus <sofus.c@icloud.com>
+Date: Wed, 9 Sep 2026 11:19:19 +0200
+Subject: [PATCH 7/9] arm64: dts: apple: t8122-jxxx: add panel nodes
+
+Signed-off-by: sofus <sofus.c@icloud.com>
+---
+ arch/arm64/boot/dts/apple/t8122-j504.dts  | 7 +++++++
+ arch/arm64/boot/dts/apple/t8122-j613.dts  | 7 +++++++
+ arch/arm64/boot/dts/apple/t8122-j615.dts  | 7 +++++++
+ arch/arm64/boot/dts/apple/t8122-jxxx.dtsi | 7 +++++++
+ 4 files changed, 28 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t8122-j504.dts b/arch/arm64/boot/dts/apple/t8122-j504.dts
+index 4c36e01ba..3c9a0595f 100644
+--- a/arch/arm64/boot/dts/apple/t8122-j504.dts
++++ b/arch/arm64/boot/dts/apple/t8122-j504.dts
+@@ -31,6 +31,13 @@ led-0 {
+ 	};
+ };
+ 
++&panel {
++	compatible = "apple,panel-j504", "apple,panel";
++	width-mm = <302>;
++	height-mm = <196>;
++	adj-height-mm = <189>;
++};
++
+ &wifi0 {
+ 	brcm,board-type = "apple,tresco";
+ };
+diff --git a/arch/arm64/boot/dts/apple/t8122-j613.dts b/arch/arm64/boot/dts/apple/t8122-j613.dts
+index aa9e49dc4..87623fd48 100644
+--- a/arch/arm64/boot/dts/apple/t8122-j613.dts
++++ b/arch/arm64/boot/dts/apple/t8122-j613.dts
+@@ -31,6 +31,13 @@ led-0 {
+ 	};
+ };
+ 
++&panel {
++	compatible = "apple,panel-j613", "apple,panel";
++	width-mm = <290>;
++	height-mm = <189>;
++	adj-height-mm = <181>;
++};
++
+ &wifi0 {
+ 	brcm,board-type = "apple,dnieper";
+ };
+diff --git a/arch/arm64/boot/dts/apple/t8122-j615.dts b/arch/arm64/boot/dts/apple/t8122-j615.dts
+index 99e6fd33d..044a1f40c 100644
+--- a/arch/arm64/boot/dts/apple/t8122-j615.dts
++++ b/arch/arm64/boot/dts/apple/t8122-j615.dts
+@@ -31,6 +31,13 @@ led-0 {
+ 	};
+ };
+ 
++&panel {
++	compatible = "apple,panel-j615", "apple,panel";
++	width-mm = <290>; // TODO
++	height-mm = <189>; // TODO
++	adj-height-mm = <181>;
++};
++
+ &aop_mbox {
+ 	status = "okay";
+ };
+diff --git a/arch/arm64/boot/dts/apple/t8122-jxxx.dtsi b/arch/arm64/boot/dts/apple/t8122-jxxx.dtsi
+index ec6f3692f..6af8e9beb 100644
+--- a/arch/arm64/boot/dts/apple/t8122-jxxx.dtsi
++++ b/arch/arm64/boot/dts/apple/t8122-jxxx.dtsi
+@@ -62,6 +62,13 @@ memory@800000000 {
+ 	};
+ };
+ 
++&dcp {
++	panel: panel {
++		apple,max-brightness = <500>;
++	};
++};
++
++
+ &serial0 {
+ 	status = "okay";
+ };
+-- 
+2.56.0
+

@@ -1,0 +1,24 @@
+#!/bin/bash
+# Load the G15 GPU driver on a booted G15 kernel (kernel/build.sh), with the
+# options it was tested with. Run as root, once per boot:  g15-load
+#
+# The GPU firmware cannot be reset, so the asahi module cannot be unloaded or
+# loaded twice on one boot; reboot instead.
+set -eu
+case "$(uname -r)" in
+    *-display-driver-g15) ;;
+    *) echo "not the G15 kernel ($(uname -r)): boot the G15 entry first"; exit 2 ;;
+esac
+if [ -e /sys/kernel/debug/asahi/g15_accounting ]; then
+    echo "the G15 driver is already loaded on this boot"; exit 0
+fi
+# Refuses (ENODEV) unless this is a J613 whose iBoot loaded the macOS 14.7
+# GPU firmware; see kernel/README.md.
+modprobe g15_dt_overlay
+modprobe --ignore-install asahi g15_render_trial=1 g15_stage_delay_ms=0 \
+    g15_recovery=1 g15_ordinary_compute=1 g15_render_user_vdm=1 g15_render_user_rt=1 \
+    g15_render_user_regs=1 g15_render_mesa_shape=1 g15_render_bridge=1 \
+    g15_render_user_bgeot=1 g15_job_timeout_ms=5000
+sleep 2
+grep -E '^(crashed|submissions)=' /sys/kernel/debug/asahi/g15_accounting
+echo "G15 driver loaded"

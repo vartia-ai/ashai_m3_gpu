@@ -1,0 +1,28 @@
+From 74a3a410c5dcdd20a4f33f396aff0fd1d313c1df Mon Sep 17 00:00:00 2001
+From: sofus <sofus.c@icloud.com>
+Date: Wed, 9 Sep 2026 10:16:01 +0200
+Subject: [PATCH 1/9] arm64: dts: apple: t603x-j514-j516: add dcp aliases
+
+Signed-off-by: sofus <sofus.c@icloud.com>
+---
+ arch/arm64/boot/dts/apple/t603x-j514-j516.dtsi | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/t603x-j514-j516.dtsi b/arch/arm64/boot/dts/apple/t603x-j514-j516.dtsi
+index 74fd80bc5..63cf382a0 100644
+--- a/arch/arm64/boot/dts/apple/t603x-j514-j516.dtsi
++++ b/arch/arm64/boot/dts/apple/t603x-j514-j516.dtsi
+@@ -41,6 +41,10 @@ aliases {
+ 		usb4_1_nhi = &usb4_1_nhi;
+ 		usb4_2_rc = &usb4_2_acio;
+ 		usb4_2_nhi = &usb4_2_nhi;
++
++		dcp = &dcp;
++		disp0 = &display;
++		disp0_piodma = &disp0_piodma;
+ 	};
+ 
+ 	chosen {
+-- 
+2.56.0
+

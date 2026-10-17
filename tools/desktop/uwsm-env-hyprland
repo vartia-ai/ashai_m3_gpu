@@ -1,10 +1,11 @@
-# M3 GPU (G15, m3gpu project): on the display-driver-g15 kernel, load the
+# M3 GPU (G15, m3gpu project): on the G15 kernel (release *-display-driver-g15), load the
 # G15 GPU driver and run this Hyprland session on the G15 Mesa. On any other
 # kernel, or on a test-harness boot, this file does nothing. To disable:
 # delete this file.
 # A test-harness boot (tools/j613-live.sh leaves this marker before it
 # reboots and removes it when done) loads its own driver: leave it alone.
-if grep -q 'BOOT_IMAGE=/display-driver-g15/' /proc/cmdline && [ ! -e "$HOME/.cache/m3gpu-harness-boot" ]; then
+case "$(uname -r)" in *-display-driver-g15) g15_kernel=1 ;; *) g15_kernel= ;; esac
+if [ -n "$g15_kernel" ] && [ ! -e "$HOME/.cache/m3gpu-harness-boot" ]; then
     sudo -n /usr/local/sbin/g15-load >/tmp/g15-load.log 2>&1
     if grep -q '^asahi ' /proc/modules; then
         G15_MESA=${G15_MESA:-$HOME/g15-mesa}

@@ -1,10 +1,10 @@
 # G15 desktop session helpers
 
 Example scripts used to run an Omarchy/Hyprland desktop on the G15 GPU on a
-MacBook Air M3 (J613). They assume the G15 kernel driver is loaded by a
-site-specific `/usr/local/sbin/g15-load` (the kernel driver is not part of
-this release yet; see the top-level README) and a G15 Mesa build installed
-under `$G15_MESA` (default `~/g15-mesa`).
+MacBook Air M3 (J613). They assume the G15 kernel from [../../kernel](../../kernel/README.md),
+its loader installed as `/usr/local/sbin/g15-load` (with a sudoers rule letting
+the session run it without a password), and a G15 Mesa build installed under
+`$G15_MESA` (default `~/g15-mesa`), as in [../../AGENTS.md](../../AGENTS.md).
 
 | File | Install as | Purpose |
 |---|---|---|
@@ -18,6 +18,4 @@ Keep the login screen's compositor on the CPU renderer (for SDDM:
 `CompositorCommand` with `MESA_LOADER_DRIVER_OVERRIDE=kms_swrast`), so it stays
 usable whether or not the G15 driver is loaded.
 
-Known: logging out of the G15 session while the driver is loaded can leave the
-display firmware (DCP) unstable; reboot to leave the session. A GPU hang the
-firmware does not report freezes the session (reboot).
+A GPU hang the firmware does not report freezes the session (reboot).
