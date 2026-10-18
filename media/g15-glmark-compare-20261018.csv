@@ -1,0 +1,8 @@
+idx,scene,llvmpipe_median,g15_median,ratio_g15_over_llvmpipe
+1,"[texture] texture-filter=nearest",327,477,1.46
+2,"[texture] texture-filter=linear",296,483,1.63
+3,"[effect2d] kernel=0,1,0;1,-4,1;0,1,0;",89,395,4.44
+4,"[effect2d] kernel=1,1,1,1,1;1,1,1,1,1;1,1,1,1,1;",44,280,6.36
+5,"[pulsar] light=false:quads=5:texture=false",227,469,2.07
+6,"[desktop] blur-radius=5:effect=blur:passes=1:separable=true:windows=4",26,56,2.15
+7,"[desktop] effect=shadow:windows=4",56,229,4.09

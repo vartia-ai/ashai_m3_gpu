@@ -354,50 +354,28 @@ Linux renders without it, and reproducing it in native order changes nothing
 | The stream grammar matches PowerVR's IPF/SIPF2 (Mesa `src/imagination/csbgen/rogue/ipf.xml`): byte-granular primitive headers, a 4-byte link packet, a 1-byte terminator | [INFERRED] |
 | Linux and macOS TAs write byte-identical lists for the same work (x160 and x192 records, terminators and padding match) | [HW] [NATIVE] |
 
-### The limit
+### The limit and its cause
 
-On Linux, the fragment pass cannot consume the second 64-byte half of a
-chunk. A tile whose list carries content past byte 0x40 of a chunk hangs the
-fragment unit: the firmware parks in its wait on unit 1 about 0.1 ms in, RGX
-+0xc120 stays 2, no pixel of that tile is shaded, and the firmware reports
-`Timeout` [HW]. macOS consumes the same bytes [NATIVE].
+Before the fix, Linux's fragment pass could not consume the second 64-byte
+half of a chunk: a tile whose list carried content past byte 0x40 hung the
+fragment unit (the firmware parked in its wait on unit 1, no pixel of that
+tile was shaded, `Timeout`), while macOS consumed the same bytes [HW]
+[NATIVE]. One tile passed at 160 stacked triangles (list ends 0x3f) and hung
+at 168 (0x43); full-panel overdraw passed at 50 quads and hung at 51 [HW].
 
-| Test (hotspot, 128x128 D32F, x168 unless noted) | Result | Tag |
-|---|---|---|
-| TA completes before the 3D command is published | hangs: not an ordering race | [HW] |
-| Only the final words replaced by the x160 ending (list ends before 0x40) | passes | [HW] |
-| Only the TPC tail changed | hangs | [HW] |
-| List rewritten unchanged with the same cache maintenance; scan only | hangs | [HW] |
-| Every record kept, a link at +0x38 to a fresh 0x80-aligned chunk, tail rebased | x168 and x192 pass, exact images | [HW] |
+The cause is bit 0 of the Fragment ISP control word `0x15021`. The built-in
+profile carried `0xc001` from macOS's small renders; macOS's long-list renders
+use `0xc000`. Changing only that bit moves the failure both ways: macOS's own
+long-list job, replayed through the Linux driver, hangs with `0xc001`, and
+Mesa's long-list renders complete exactly with `0xc000` [HW] [NATIVE]. What
+the bit selects in the fragment pass is not known [UNKNOWN]. The kernel
+clears it in every render (`g15_frag_15021_bit0`, default 0).
 
-Thresholds follow from it: one tile passes at 160 stacked triangles (list
-ends 0x3f) and hangs at 168 (0x43); full-panel overdraw passes at 50 quads
-(0x38) and hangs at 51 (0x43) [HW]. The "partial render never completes"
-symptom of earlier tests was this limit: no partial render is ever needed for
-these sizes [HW].
-
-### What does not explain the difference
-
-Every per-render input matches macOS or was set to the macOS value without
-effect: TA/3D register lists and full command bodies, VDM/PPP words, all
-shaders (macOS's compiled fragment shader swapped in), coefficient tables,
-TVB/tilemap/TPC/heapmeta layout, VAs and block IDs, PTE classes,
-InitData/HwDataA/HwDataB, the DeviceControl 0x1b/Event 0x0e handshake, the
-PMP/DCS/fabric platform setup, and CPU MMIO (macOS writes only the 24
-pmgr[54] fabric words in the whole sgx span) [HW] [NATIVE]. The differing
-setting is GPU-global state the firmware programs: its init does
-read-modify-writes that keep bits from the GPU's incoming state, for example
-RGX +0x16420 (Linux `0x100f0f05`); the macOS values could not be read because
-macOS renders finish before a safe read point [UNKNOWN].
-
-Rogue `TE_PSG.cs_size` (TA 0x1c0b1/0x1c850 bit 21) has no effect on G15's
-lists [HW].
-
-### Two busy queues
-
-Two processes rendering heavily at the same time produce recovered timeouts
-with damaged TVB page lists; light alternation runs clean [HW]. Whether this
-is the same limit is not yet tested [UNKNOWN].
+Earlier experiments that are now explained by the bit: inputs, device setup,
+timing and placement all matched macOS without effect, because the setting
+that differed was in the profile's own register list. The list relinker that
+worked around the limit (rewriting long lists into chunks that end by +0x38
+with a link) is off by default (`g15_relink`, kept for diagnostics) [HW].
 
 ## Where render state comes from
 
@@ -418,10 +396,8 @@ as the tests reach [HW], but their meaning is [UNKNOWN].
 
 ## Open questions
 
-- **The per-tile list limit (section 9).** Which firmware-programmed global
-  setting lets macOS's fragment pass read a chunk's second 64-byte half.
-  Until a partial render executes on Linux, the partial-program fields
-  (+0x928/+0x930, +0xa14/+0xa1c) are written but unqualified. [UNKNOWN]
+- **Fragment ISP control bit 0 (`0x15021`).** Clearing it fixed the per-tile
+  list limit; what it selects is not known. [UNKNOWN]
 - **Constants still taken from one capture.** Renders run without any captured
   state, but these values are native constants whose producers are not
   known, so they may need to vary for workloads not yet tested:

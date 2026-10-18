@@ -4,9 +4,10 @@
 > **Early research release, one machine only.** It installs and runs on a
 > MacBook Air 13" M3 (J613) whose Linux install uses the macOS 14.7 stub
 > firmware, and nowhere else: the driver refuses to start on other models or
-> firmware. It has been tested on one such laptop. Expect GPU hangs that need a
-> reboot, slow mesh-heavy apps, missing GL features, and no support. Do not use
-> it on a machine you cannot afford to reboot.
+> firmware. It has been tested on one such laptop. A GPU hang the firmware does
+> not report (for example an app's infinite-loop shader) needs a reboot, GL is
+> at the 2.1 level (GLES 3.0), and there is no support. Do not use it on a
+> machine you cannot afford to reboot.
 
 A working GPU-accelerated Linux desktop on a MacBook Air M3 (J613, T8122,
 GPU G15G, firmware 14.7): Hyprland and GL/GLES clients rendered by the M3 GPU
@@ -20,26 +21,34 @@ scene, all on the G15 GPU).
 
 ## Status
 
-| | G15 | CPU renderer (llvmpipe) |
+| glmark2 scene, 1920x1080 window in Weston (median of 3 passes) | G15 | llvmpipe (CPU) |
 |---|---|---|
-| Hyprland + weston-simple-egl | 57-60 fps | 59-60 fps |
-| glmark2 texture scene | 113 fps | 112 fps |
-| glmark2 Gouraud mesh | **2 fps** | 95 fps |
-| Whole-system CPU busy, Hyprland + simple-egl | 3% | 15% |
-| Whole-system CPU busy, Hyprland + glmark2 | 11% | 47% |
+| texture, nearest filtering | 477 fps | 327 fps |
+| texture, linear filtering | 483 fps | 296 fps |
+| effect2d, 3x3 kernel | 395 fps | 89 fps |
+| effect2d, 5x5 kernel | 280 fps | 44 fps |
+| pulsar | 469 fps | 227 fps |
+| desktop, blur | 56 fps | 26 fps |
+| desktop, shadow | 229 fps | 56 fps |
+| **Score** | **343** | **151** |
 
-Raw numbers: [media/g15-hyprland-demo-numbers.tsv](media/g15-hyprland-demo-numbers.tsv).
+Raw numbers: [media/g15-glmark-compare-20261018.csv](media/g15-glmark-compare-20261018.csv).
+Mesh-heavy scenes are no longer slow: in the full offscreen glmark2 run at
+2560x1664 the Gouraud-shaded mesh renders at 479 fps (2 fps in the previous
+release) and the build scene at 537-548 fps.
 
-Also: 305 of 306 tests in our desktop-GL piglit list, a complete glmark2 run
-(score 91; its terrain scene's compute stage is refused, as expected), and a
-one-hour soak with 873,352 GPU jobs and no GPU errors or recoveries.
+Also: all 306 tests in our desktop-GL piglit list, a complete glmark2 run
+(score 443; its terrain scene's compute stage is refused, as
+expected), a one-hour Hyprland soak with 676,080 GPU jobs, and
+1,000 fresh GL processes in a row, all with no GPU errors or
+recoveries.
 
-**Known limits.** Mesh-heavy scenes are slow: renders are kept small
-because of an unresolved per-tile primitive-list limit on Linux (the
-"64-byte cliff"), and each render costs a fixed ~0.7 ms. Desktop GL is at the
-2.1 level plus extensions (GLES 3.0), with no MSAA or framebuffer compression.
-See [docs/g15-spec/70-known-limits.md](docs/g15-spec/70-known-limits.md) for
-the full list and everything known about the open problem.
+**Known limits.** A GPU hang the firmware does not report needs a reboot
+(faults and the timeouts it reports recover). One GPU job runs at a time,
+with a short wait after each render. Desktop GL is at the 2.1 level plus
+extensions (GLES 3.0), with no MSAA or framebuffer compression. See
+[docs/g15-spec/70-known-limits.md](docs/g15-spec/70-known-limits.md) for the
+full list and what is known about each.
 
 ## Can I use it?
 

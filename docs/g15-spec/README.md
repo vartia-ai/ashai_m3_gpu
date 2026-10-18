@@ -15,9 +15,10 @@ what is different on G15.
 | MMU-fault and firmware-timeout recovery | Working, without a reboot |
 | Render: Mesa VS/FS, uniforms, textures (fragment and vertex), clears, reload/store programs, depth (D32F, D16), stencil, depth-only passes, mip-level targets | Working: linear and GPU-tiled RGBA8 and BGRA8 targets up to 8192x8192 |
 | Render setup | Derived from the command plus constants documented per field (see [Render jobs](30-render.md#where-render-state-comes-from)); no captured bundle at render time |
-| Per-tile list limit (G2) | Open: a tile list running past byte 0x40 of a chunk hangs the fragment pass. Mesa keeps renders small (32 primitives, 8 draws) and the kernel relinks marked long lists; mesh-heavy scenes stay slow. See [Known limits](70-known-limits.md) |
-| Desktop GL | 305 of the 306-test list pass (the one failure, longprim, is the partial-render limit); scissor, blending, logic ops, clip planes, discard, non-perspective varyings; glmark2 full run completes (score 91); its terrain scene's compute stage is refused (G15 graphics-mode compute is not supported), as expected |
-| Long-running use | glmark2 full run at 2560x1664 with no errors; Hyprland with GL clients, one-hour soak (873,352 jobs) with no errors; several GL processes at once |
+| Per-tile list limit (G2) | Fixed: the cause was bit 0 of the Fragment ISP control word `0x15021`, which the kernel now clears in every render. Renders have no primitive or draw cap. See [Known limits](70-known-limits.md) |
+| Partial renders | Working with Mesa's reload/store programs: a 262,144-triangle render runs 4 partial renders (as macOS does) with exact colour and depth |
+| Desktop GL | All 306 tests of the 306-test list pass; scissor, blending, logic ops, clip planes, discard, non-perspective varyings; glmark2 full run completes (score 443); its terrain scene's compute stage is refused (G15 graphics-mode compute is not supported), as expected |
+| Long-running use | glmark2 full run at 2560x1664 with no errors; Hyprland with GL clients, one-hour soak (676,080 jobs) with no errors; several GL processes at once; 1,000 fresh GL processes in a row |
 | Hangs the firmware does not report | Fail-stop cleanly. A reboot is still needed |
 | Display | Mesa frames scanned out full screen through the DCP display driver (KMS/GBM); see [Display](60-display.md) |
 

@@ -8,10 +8,10 @@ as one diff against Gravity Mesa commit `87ac51d411f0e58a9433567ec2666f457be89e1
 - the Gallium render flush for G15 (VDM/PPP streams, attachments, render
   targets up to 8192x8192, linear and GPU-tiled RGBA8/BGRA8, D32F/D16 depth,
   S8 stencil, depth-only passes, mip levels);
-- Mesa's own background/reload and end-of-tile programs;
-- external textures (needed by Hyprland), and per-render primitive/draw caps
-  that keep tile lists within the hardware limit described in
-  `docs/g15-spec/70-known-limits.md`;
+- Mesa's own background/reload, end-of-tile and partial-render programs
+  (partial renders let a render hold more geometry than the tiler buffer;
+  renders have no primitive or draw cap by default);
+- external textures (needed by Hyprland);
 - environment switches (`ASAHI_G15_*`) for experiments and diagnostics.
 
 The public patch omits one private diagnostic (loading macOS-compiled

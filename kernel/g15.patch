@@ -970,7 +970,7 @@ index 2711b7848..6ddaab6b3 100644
          ret
      }
 diff --git a/drivers/gpu/drm/asahi/asahi.rs b/drivers/gpu/drm/asahi/asahi.rs
-index ff366b3fc..bbd8c24d3 100644
+index ff366b3fc..9807a3ae2 100644
 --- a/drivers/gpu/drm/asahi/asahi.rs
 +++ b/drivers/gpu/drm/asahi/asahi.rs
 @@ -12,6 +12,7 @@
@@ -990,7 +990,7 @@ index ff366b3fc..bbd8c24d3 100644
  mod slotalloc;
  mod util;
  #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
-@@ -55,5 +58,281 @@
+@@ -55,5 +58,289 @@
              // permissions: 0o644,
              description: "Fully isolate GPU contexts (limits performance)",
          },
@@ -1053,6 +1053,10 @@ index ff366b3fc..bbd8c24d3 100644
 +        g15_render_user_bgeot: u32 {
 +            default: 0,
 +            description: "G15 (I09 R7): with g15_render_bridge, a plain render with a nonzero bg.usc (eot.usc) uses its own background (end-of-tile) program instead of the bundle's (0: always the bundle's)",
++        },
++        g15_retire_spin_us: u32 {
++            default: 50,
++            description: "G15: the age waits (g15_reseed_min_age_us, g15_teardown_age_us) sleep with no slack until this many us before the deadline, then spin the rest (0: sleep all the way; >= the wait: spin all of it)",
 +        },
 +        g15_teardown_age_us: u32 {
 +            default: 0,
@@ -1223,8 +1227,12 @@ index ff366b3fc..bbd8c24d3 100644
 +            description: "G15 G2 experiment: bit values for g15_rgx_set_off (within g15_rgx_set_mask)",
 +        },
 +        g15_relink: u32 {
-+            default: 1,
-+            description: "G15 G2 workaround: publish 3D only after the TA completes and rewrite every tile list with content past byte 0x40 of a chunk into chunks that end by +0x40: 1 (default) only renders Mesa marks DRM_ASAHI_RENDER_G15_LONG_LISTS, 2 every render, 0 off",
++            default: 0,
++            description: "G15 G2 workaround, superseded by g15_frag_15021_bit0=0: publish 3D only after the TA completes and rewrite every tile list with content past byte 0x40 of a chunk into chunks that end by +0x40: 1 only renders Mesa marks DRM_ASAHI_RENDER_G15_LONG_LISTS, 2 every render, 0 off (default)",
++        },
++        g15_frag_15021_bit0: u32 {
++            default: 0,
++            description: "G15: Fragment register 0x15021 (ISP control) bit 0: 0 (default) clear in every render, as native long-list renders have it (0xc000); with it set, a tile list past byte 0x40 of its chunk times out (G2). 1 sets it, 2 keeps the profile's 0xc001, 3 clears it only on renders Mesa marks DRM_ASAHI_RENDER_G15_LONG_LISTS, 4 keeps the profile's value on each queue's first render and clears it after",
 +        },
 +        g15_tilemap_zero: u32 {
 +            default: 1,
@@ -5740,7 +5748,7 @@ index 50628ade5..f1ec38e6e 100644
 +    }
 +}
 diff --git a/drivers/gpu/drm/asahi/driver.rs b/drivers/gpu/drm/asahi/driver.rs
-index bafcfc4ed..3af8c5998 100644
+index bafcfc4ed..e2b9bb4e4 100644
 --- a/drivers/gpu/drm/asahi/driver.rs
 +++ b/drivers/gpu/drm/asahi/driver.rs
 @@ -14,10 +14,14 @@
@@ -5768,7 +5776,7 @@ index bafcfc4ed..3af8c5998 100644
      regs, //
  };
  
-@@ -38,23 +43,116 @@ pub(crate) struct AsahiData {
+@@ -38,23 +43,138 @@ pub(crate) struct AsahiData {
      pub(crate) gpu: Arc<dyn gpu::GpuManager>,
      pub(crate) pdev: ARef<platform::Device>,
      pub(crate) resources: regs::Resources,
@@ -5828,6 +5836,28 @@ index bafcfc4ed..3af8c5998 100644
 +        writeln!(f, "teardown_age_waits={}", a[0].load(Relaxed))?;
 +        writeln!(f, "teardown_age_total_ns={}", a[1].load(Relaxed))?;
 +        writeln!(f, "teardown_age_max_ns={}", a[2].load(Relaxed))?;
++        let s = &crate::queue::g15_render_job::G15_AGE_SLEEP;
++        writeln!(
++            f,
++            "age_sleeps={} age_sleep_late_total_ns={} age_sleep_late_max_ns={} age_spins={}",
++            s[0].load(Relaxed),
++            s[1].load(Relaxed),
++            s[2].load(Relaxed),
++            s[3].load(Relaxed)
++        )?;
++        let p = &crate::queue::g15_render_job::G15_PARTIALS;
++        writeln!(f, "partial_renders={} partials={}", p[0].load(Relaxed), p[1].load(Relaxed))?;
++        for (who, g) in ["queue", "vm"].iter().zip(crate::queue::g15_render_job::G15_TEARDOWN_GAP.iter()) {
++            writeln!(
++                f,
++                "teardown_gap_{}: claims={} min_ns={} under_500us={} under_2ms={}",
++                who,
++                g[0].load(Relaxed),
++                g[1].load(Relaxed),
++                g[2].load(Relaxed),
++                g[3].load(Relaxed)
++            )?;
++        }
 +    }
 +    writeln!(
 +        f,
@@ -5889,7 +5919,7 @@ index bafcfc4ed..3af8c5998 100644
  /// DRM Driver metadata
  const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
      major: 0,
-@@ -69,17 +167,19 @@ unsafe impl Sync for AsahiDriver {}
+@@ -69,17 +189,19 @@ unsafe impl Sync for AsahiDriver {}
  impl drm::driver::Driver for AsahiDriver {
      /// Our `DeviceData` type, reference-counted
      type Data = AsahiData;
@@ -5914,7 +5944,7 @@ index bafcfc4ed..3af8c5998 100644
  
      kernel::declare_drm_ioctls! {
          (ASAHI_GET_PARAMS,      drm_asahi_get_params,
-@@ -104,6 +204,12 @@ impl drm::driver::Driver for AsahiDriver {
+@@ -104,6 +226,12 @@ impl drm::driver::Driver for AsahiDriver {
              ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::queue_destroy),
          (ASAHI_SUBMIT,          drm_asahi_submit,
              ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::submit),
@@ -5927,7 +5957,7 @@ index bafcfc4ed..3af8c5998 100644
      }
  }
  
-@@ -121,6 +227,10 @@ impl drm::driver::Driver for AsahiDriver {
+@@ -121,6 +249,10 @@ impl drm::driver::Driver for AsahiDriver {
              of::DeviceId::new(c_str!("apple,agx-t8112")),
              &hw::t8112::HWCONFIG
          ),
@@ -5938,7 +5968,7 @@ index bafcfc4ed..3af8c5998 100644
          (
              of::DeviceId::new(c_str!("apple,agx-t6000")),
              &hw::t600x::HWCONFIG_T6000
-@@ -151,19 +261,403 @@ impl drm::driver::Driver for AsahiDriver {
+@@ -151,19 +283,403 @@ impl drm::driver::Driver for AsahiDriver {
  /// Platform Driver implementation for `AsahiDriver`.
  impl platform::Driver for AsahiDriver {
      type IdInfo = &'static hw::HwConfig;
@@ -6346,7 +6376,7 @@ index bafcfc4ed..3af8c5998 100644
          unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
  
          let res = regs::Resources::new(pdev)?;
-@@ -187,7 +681,14 @@ fn probe(
+@@ -187,7 +703,14 @@ fn probe(
          let uninit = unsafe {
              pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
          };
@@ -6362,7 +6392,7 @@ index bafcfc4ed..3af8c5998 100644
  
          let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
              (hw::GpuGen::G13, _, &[12, 3, 0]) => {
-@@ -221,17 +722,29 @@ fn probe(
+@@ -221,17 +744,29 @@ fn probe(
              gpu,
              pdev: pdev.into(),
              resources: res,
@@ -6479,7 +6509,7 @@ index edd7d701e..5967c07ca 100644
      pub(crate) fn fail_all(&self, error: workqueue::WorkError) {
          let mut owners: KVec<Arc<dyn workqueue::WorkQueue + Send + Sync>> = KVec::new();
 diff --git a/drivers/gpu/drm/asahi/file.rs b/drivers/gpu/drm/asahi/file.rs
-index 061f289e4..3d666475c 100644
+index 061f289e4..31de41f8f 100644
 --- a/drivers/gpu/drm/asahi/file.rs
 +++ b/drivers/gpu/drm/asahi/file.rs
 @@ -14,6 +14,7 @@
@@ -6566,7 +6596,7 @@ index 061f289e4..3d666475c 100644
 +        if let (Some(gate), Some(dev)) = (self.g15_job_gate.as_ref(), self.g15_dev.as_ref()) {
 +            let max_ms = queue::G15_TEARDOWN_WAIT_MAX_MS;
 +            self.g15_teardown_slot =
-+                queue::G15JobGate::claim_for_teardown(gate, max_ms, &|| dev.gpu.is_crashed());
++                queue::G15JobGate::claim_for_teardown(gate, max_ms, &|| dev.gpu.is_crashed(), 1);
 +            if self.g15_teardown_slot.is_none() {
 +                // No slot: a job may still run (120 s ceiling passed, or the
 +                // GPU crashed with an uncancelable job). Leave the user range
@@ -6600,12 +6630,10 @@ index 061f289e4..3d666475c 100644
          // When the user Vm is dropped, unmap everything in the user range
          let left_range = VM_USER_RANGE.start..self.kernel_range.start;
          let right_range = self.kernel_range.end..VM_USER_RANGE.end;
-@@ -201,11 +286,22 @@ pub(crate) enum Object {
+@@ -201,6 +286,20 @@ pub(crate) enum Object {
  // #[pin_data]
  pub(crate) struct File {
      id: u64,
--    // #[pin]
--    vms: xarray::XArray<KBox<Vm>>,
 +    // E154 exact J615 IOGPUDevice +0x60 counterpart. Apple snapshots
 +    // proc_pid(get_bsdtask_info(task)) at per-client device construction and
 +    // copies it through IOGPUCommandQueue +0x490 -> AGXChannel +0x4c. Capture
@@ -6614,18 +6642,16 @@ index 061f289e4..3d666475c 100644
 +    /// G15: the client called DRM_IOCTL_ASAHI_G15_OPT_IN; SUBMIT is ENODEV
 +    /// until it has.
 +    g15_opt_in: AtomicBool,
-+    // Fields drop in declaration order: queues before vms, so a closing
-+    // file's queue teardown (which takes the G15 job slot) is done before
-+    // the Vms unmap (which take it too).
++    // Fields drop in declaration order: vms before queues. Each Vm drop
++    // takes the G15 job slot before it unmaps, so a killed client's running
++    // render finishes first. Queues first (ef6f2435d) crashed the firmware
++    // under fresh-process churn (q22 drain timeout after the next client's
++    // first render, G2 areas row 66) with the same completion-to-teardown
++    // gaps as this order, which passed 720/720 (`dropA-233138`).
      // #[pin]
-     queues: xarray::XArray<Arc<Mutex<KBox<dyn queue::Queue>>>>,
+     vms: xarray::XArray<KBox<Vm>>,
      // #[pin]
-+    vms: xarray::XArray<KBox<Vm>>,
-+    // #[pin]
-     objects: xarray::XArray<KBox<Object>>,
- }
- 
-@@ -227,9 +323,14 @@ fn open(device: &AsahiDevice) -> Result<Pin<KBox<Self>>> {
+@@ -227,9 +326,14 @@ fn open(device: &AsahiDevice) -> Result<Pin<KBox<Self>>> {
  
          let gpu = &device.gpu;
          let id = gpu.ids().file.next();
@@ -6641,7 +6667,7 @@ index 061f289e4..3d666475c 100644
      }
  
      fn as_raw(&self) -> *mut bindings::drm_file {
-@@ -240,8 +341,28 @@ fn as_raw(&self) -> *mut bindings::drm_file {
+@@ -240,8 +344,28 @@ fn as_raw(&self) -> *mut bindings::drm_file {
  // SAFETY: All bit patterns are valid by construction.
  unsafe impl AnyBitPattern for uapi::drm_asahi_gem_bind_op {}
  
@@ -6671,7 +6697,7 @@ index 061f289e4..3d666475c 100644
          unsafe {
              pin_init::pin_init_from_closure(move |slot: *mut Self| {
                  let raw_vms = addr_of_mut!((*slot).vms);
-@@ -259,6 +380,8 @@ fn new(id: u64) -> impl PinInit<Self, Error> {
+@@ -259,6 +383,8 @@ fn new(id: u64) -> impl PinInit<Self, Error> {
                      .__pinned_init(raw_objects)?;
  
                  (*slot).id = id;
@@ -6680,7 +6706,7 @@ index 061f289e4..3d666475c 100644
                  Ok(())
              })
          }
-@@ -285,8 +408,9 @@ fn objects(self: Pin<&Self>) -> Pin<&xarray::XArray<KBox<Object>>> {
+@@ -285,8 +411,9 @@ fn objects(self: Pin<&Self>) -> Pin<&xarray::XArray<KBox<Object>>> {
  
      /// IOCTL: get_param: Get a driver parameter value.
      pub(crate) fn get_params(
@@ -6692,7 +6718,7 @@ index 061f289e4..3d666475c 100644
          file: &DrmFile,
      ) -> Result<u32> {
          mod_dev_dbg!(device, "[File {}]: IOCTL: get_params\n", file.inner().id);
-@@ -324,13 +448,35 @@ pub(crate) fn get_params(
+@@ -324,13 +451,35 @@ pub(crate) fn get_params(
              max_frequency_khz: gpu.get_dyncfg().pwr.max_frequency_khz(),
  
              command_timestamp_frequency_hz: 1_000_000_000, // User timestamps always in nanoseconds
@@ -6729,7 +6755,7 @@ index 061f289e4..3d666475c 100644
              params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
          }
  
-@@ -350,7 +496,8 @@ pub(crate) fn get_params(
+@@ -350,7 +499,8 @@ pub(crate) fn get_params(
  
      /// IOCTL: vm_create: Create a new `Vm`.
      pub(crate) fn vm_create(
@@ -6739,7 +6765,7 @@ index 061f289e4..3d666475c 100644
          data: &mut uapi::drm_asahi_vm_create,
          file: &DrmFile,
      ) -> Result<u32> {
-@@ -418,12 +565,135 @@ pub(crate) fn vm_create(
+@@ -418,12 +568,135 @@ pub(crate) fn vm_create(
              GFP_KERNEL,
          )?;
  
@@ -6875,7 +6901,7 @@ index 061f289e4..3d666475c 100644
          let mut dummy_obj = gem::new_kernel_object(device, 0x4000)?;
          dummy_obj.vmap()?.memset(0);
          let dummy_mapping =
-@@ -434,9 +704,29 @@ pub(crate) fn vm_create(
+@@ -434,9 +707,29 @@ pub(crate) fn vm_create(
              Vm {
                  ualloc,
                  ualloc_priv,
@@ -6906,7 +6932,7 @@ index 061f289e4..3d666475c 100644
              },
              GFP_KERNEL,
          )?)?;
-@@ -448,7 +738,8 @@ pub(crate) fn vm_create(
+@@ -448,7 +741,8 @@ pub(crate) fn vm_create(
  
      /// IOCTL: vm_destroy: Destroy a `Vm`.
      pub(crate) fn vm_destroy(
@@ -6916,7 +6942,7 @@ index 061f289e4..3d666475c 100644
          data: &mut uapi::drm_asahi_vm_destroy,
          file: &DrmFile,
      ) -> Result<u32> {
-@@ -462,7 +753,8 @@ pub(crate) fn vm_destroy(
+@@ -462,7 +756,8 @@ pub(crate) fn vm_destroy(
  
      /// IOCTL: gem_create: Create a new GEM object.
      pub(crate) fn gem_create(
@@ -6926,7 +6952,7 @@ index 061f289e4..3d666475c 100644
          data: &mut uapi::drm_asahi_gem_create,
          file: &DrmFile,
      ) -> Result<u32> {
-@@ -517,7 +809,8 @@ pub(crate) fn gem_create(
+@@ -517,7 +812,8 @@ pub(crate) fn gem_create(
  
      /// IOCTL: gem_mmap_offset: Assign an mmap offset to a GEM object.
      pub(crate) fn gem_mmap_offset(
@@ -6936,7 +6962,7 @@ index 061f289e4..3d666475c 100644
          data: &mut uapi::drm_asahi_gem_mmap_offset,
          file: &DrmFile,
      ) -> Result<u32> {
-@@ -540,8 +833,9 @@ pub(crate) fn gem_mmap_offset(
+@@ -540,8 +836,9 @@ pub(crate) fn gem_mmap_offset(
  
      /// IOCTL: vm_bind: Map or unmap memory into a Vm.
      pub(crate) fn vm_bind(
@@ -6948,7 +6974,7 @@ index 061f289e4..3d666475c 100644
          file: &DrmFile,
      ) -> Result<u32> {
          mod_dev_dbg!(
-@@ -627,7 +921,9 @@ pub(crate) fn do_gem_bind(
+@@ -627,7 +924,9 @@ pub(crate) fn do_gem_bind(
              return Err(EINVAL);
          }
  
@@ -6959,7 +6985,7 @@ index 061f289e4..3d666475c 100644
              cls_pr_debug!(
                  Errors,
                  "gem_bind: Invalid map range {:#x}..{:#x} (not contained in user range)\n",
-@@ -661,9 +957,15 @@ pub(crate) fn do_gem_bind(
+@@ -661,9 +960,15 @@ pub(crate) fn do_gem_bind(
          // Clone it immediately so we aren't holding the XArray lock
          let vm = guarded_vm.vm.clone();
          let kernel_range = guarded_vm.kernel_range.clone();
@@ -6975,7 +7001,7 @@ index 061f289e4..3d666475c 100644
          if kernel_range.overlaps(range) {
              cls_pr_debug!(
                  Errors,
-@@ -708,7 +1010,11 @@ pub(crate) fn do_gem_unbind(
+@@ -708,7 +1013,11 @@ pub(crate) fn do_gem_unbind(
          let end = data.addr.checked_add(data.range).ok_or(EINVAL)?;
          let range = start..end;
  
@@ -6988,7 +7014,7 @@ index 061f289e4..3d666475c 100644
              cls_pr_debug!(
                  Errors,
                  "gem_bind: Invalid unmap range {:#x}..{:#x} (not contained in user range)\n",
-@@ -756,7 +1062,20 @@ pub(crate) fn unbind_gem_object(file: &DrmFile, bo: &gem::Object) -> Result {
+@@ -756,7 +1065,20 @@ pub(crate) fn unbind_gem_object(file: &DrmFile, bo: &gem::Object) -> Result {
                      // Clone since we can't hold the xarray spinlock while
                      // calling drop_mappings()
                      let vm = file_vm.borrow().vm.clone();
@@ -7009,7 +7035,7 @@ index 061f289e4..3d666475c 100644
                      vm.drop_mappings(bo)?;
                      if idx == usize::MAX {
                          break;
-@@ -771,10 +1090,12 @@ pub(crate) fn unbind_gem_object(file: &DrmFile, bo: &gem::Object) -> Result {
+@@ -771,10 +1093,12 @@ pub(crate) fn unbind_gem_object(file: &DrmFile, bo: &gem::Object) -> Result {
  
      /// IOCTL: gem_bind_object: Map or unmap a GEM object as a special object.
      pub(crate) fn gem_bind_object(
@@ -7023,7 +7049,7 @@ index 061f289e4..3d666475c 100644
          mod_dev_dbg!(
              device,
              "[File {} VM {}]: IOCTL: gem_bind_object op={:?} handle={:#x?} flags={:#x?} {:#x?}:{:#x?} object_handle={:#x?}\n",
-@@ -898,7 +1219,8 @@ pub(crate) fn do_gem_unbind_object(
+@@ -898,7 +1222,8 @@ pub(crate) fn do_gem_unbind_object(
  
      /// IOCTL: queue_create: Create a new command submission queue of a given type.
      pub(crate) fn queue_create(
@@ -7033,7 +7059,7 @@ index 061f289e4..3d666475c 100644
          data: &mut uapi::drm_asahi_queue_create,
          file: &DrmFile,
      ) -> Result<u32> {
-@@ -918,8 +1240,18 @@ pub(crate) fn queue_create(
+@@ -918,8 +1243,18 @@ pub(crate) fn queue_create(
              return Err(EINVAL);
          }
  
@@ -7054,7 +7080,7 @@ index 061f289e4..3d666475c 100644
              cls_pr_debug!(Errors, "queue_create: Invalid priority\n");
              return Err(EINVAL);
          }
-@@ -932,7 +1264,16 @@ pub(crate) fn queue_create(
+@@ -932,7 +1267,16 @@ pub(crate) fn queue_create(
          let vm = file_vm.vm.clone();
          let ualloc = file_vm.ualloc.clone();
          let ualloc_priv = file_vm.ualloc_priv.clone();
@@ -7072,7 +7098,7 @@ index 061f289e4..3d666475c 100644
          let _ = file_vm;
          core::mem::drop(guard);
  
-@@ -940,6 +1281,15 @@ pub(crate) fn queue_create(
+@@ -940,6 +1284,15 @@ pub(crate) fn queue_create(
              vm,
              ualloc,
              ualloc_priv,
@@ -7088,7 +7114,7 @@ index 061f289e4..3d666475c 100644
              // TODO: Plumb deeper the enum
              uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME - data.priority,
              data.usc_exec_base,
-@@ -953,7 +1303,8 @@ pub(crate) fn queue_create(
+@@ -953,7 +1306,8 @@ pub(crate) fn queue_create(
  
      /// IOCTL: queue_destroy: Destroy a command submission queue.
      pub(crate) fn queue_destroy(
@@ -7098,7 +7124,7 @@ index 061f289e4..3d666475c 100644
          data: &mut uapi::drm_asahi_queue_destroy,
          file: &DrmFile,
      ) -> Result<u32> {
-@@ -967,13 +1318,154 @@ pub(crate) fn queue_destroy(
+@@ -967,13 +1321,154 @@ pub(crate) fn queue_destroy(
      }
  
      /// IOCTL: submit: Submit GPU work to a command submission queue.
@@ -7254,7 +7280,7 @@ index 061f289e4..3d666475c 100644
          if data.flags != 0 || data.pad != 0 {
              cls_pr_debug!(Errors, "submit: Invalid arguments\n");
              return Err(EINVAL);
-@@ -982,7 +1474,7 @@ pub(crate) fn submit(
+@@ -982,7 +1477,7 @@ pub(crate) fn submit(
          let gpu = &device.gpu;
          gpu.update_globals();
  
@@ -7263,7 +7289,7 @@ index 061f289e4..3d666475c 100644
          let queue: Arc<Mutex<KBox<dyn queue::Queue>>> = file
              .inner()
              .queues()
-@@ -1009,6 +1501,14 @@ pub(crate) fn submit(
+@@ -1009,6 +1504,14 @@ pub(crate) fn submit(
          );
          let syncs =
              SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count)?;
@@ -7278,7 +7304,7 @@ index 061f289e4..3d666475c 100644
  
          mod_dev_dbg!(
              device,
-@@ -1054,7 +1554,8 @@ pub(crate) fn submit(
+@@ -1054,7 +1557,8 @@ pub(crate) fn submit(
  
      /// IOCTL: get_time: Get the current GPU timer value.
      pub(crate) fn get_time(
@@ -7288,7 +7314,7 @@ index 061f289e4..3d666475c 100644
          data: &mut uapi::drm_asahi_get_time,
          _file: &DrmFile,
      ) -> Result<u32> {
-@@ -1087,6 +1588,33 @@ pub(crate) fn get_time(
+@@ -1087,6 +1591,33 @@ pub(crate) fn get_time(
      }
  }
  
@@ -33471,10 +33497,10 @@ index 000000000..bfafb64df
 +}
 diff --git a/drivers/gpu/drm/asahi/queue/g15_render_job.rs b/drivers/gpu/drm/asahi/queue/g15_render_job.rs
 new file mode 100644
-index 000000000..05adc7f99
+index 000000000..4860312ec
 --- /dev/null
 +++ b/drivers/gpu/drm/asahi/queue/g15_render_job.rs
-@@ -0,0 +1,2467 @@
+@@ -0,0 +1,2575 @@
 +// SPDX-License-Identifier: GPL-2.0-only OR MIT
 +
 +//! G15 user render submission (I04 W8): one DRM_ASAHI_CMD_RENDER whose flags
@@ -34064,11 +34090,54 @@ index 000000000..05adc7f99
 +    unsafe { kernel::bindings::ktime_get() as u64 }
 +}
 +
++/// `g15_sleep_until` statistics: sleeps, ns woken past the sleep target
++/// (total, max), and spins.
++pub(crate) static G15_AGE_SLEEP: [AtomicU64; 4] =
++    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
++
++/// Wait until `g15_now_ns()` reaches `ready_ns`: sleep with no timer slack
++/// until `g15_retire_spin_us` before it, then spin the rest, so the CPU is
++/// free for most of the wait without paying the full wake-up latency.
++/// Process context only: every caller runs in a submit or teardown path
++/// that may sleep. Oversleeping only delays the caller.
++fn g15_sleep_until(ready_ns: u64) {
++    let spin_ns = u64::from(*module_parameters::g15_retire_spin_us.value()) * 1000;
++    let now = g15_now_ns();
++    if ready_ns > now + spin_ns {
++        let target = ready_ns - spin_ns;
++        let us = (target - now) / 1000;
++        if us > 0 {
++            // SAFETY: sleeping is allowed in every caller's context.
++            unsafe {
++                kernel::bindings::usleep_range_state(
++                    us as _,
++                    us as _,
++                    kernel::bindings::TASK_UNINTERRUPTIBLE,
++                )
++            };
++            let late = g15_now_ns().saturating_sub(target);
++            G15_AGE_SLEEP[0].fetch_add(1, Ordering::Relaxed);
++            G15_AGE_SLEEP[1].fetch_add(late, Ordering::Relaxed);
++            G15_AGE_SLEEP[2].fetch_max(late, Ordering::Relaxed);
++        }
++    }
++    let now = g15_now_ns();
++    if ready_ns > now {
++        G15_AGE_SLEEP[3].fetch_add(1, Ordering::Relaxed);
++        kernel::time::delay::udelay(kernel::time::Delta::from_micros(
++            (ready_ns - now).div_ceil(1000) as i64,
++        ));
++    }
++}
++
 +/// F2 containment (`g15_reseed_min_age_us`): the firmware keeps retiring the
 +/// previous render for ~100-300 us after its completion callback. Called right
 +/// after the device slot is taken, before anything is collected, allocated,
 +/// placed or reseeded, so nothing the previous render used is reused inside
-+/// that window. No host-visible end-of-retirement field is known yet.
++/// that window. The firmware writes the finished 3D event control 26..187 us
++/// after the callback, and seeding the channel's next state inside that
++/// window hangs the next job; no completion field that holds across
++/// workloads is known yet (research/g15-ship-goal.md, F3).
 +fn g15_wait_retire_age() {
 +    let age = u64::from((*module_parameters::g15_reseed_min_age_us.value()).min(10_000)) * 1000;
 +    if age == 0 {
@@ -34080,7 +34149,7 @@ index 000000000..05adc7f99
 +        G15_RETIRE_WAITS[0].fetch_add(1, Ordering::Relaxed);
 +        G15_RETIRE_WAITS[1].fetch_add(ready - now, Ordering::Relaxed);
 +        G15_RETIRE_WAITS[2].fetch_max(ready - now, Ordering::Relaxed);
-+        kernel::time::delay::udelay(kernel::time::Delta::from_micros((ready - now).div_ceil(1000) as i64));
++        g15_sleep_until(ready);
 +    }
 +}
 +
@@ -34089,6 +34158,38 @@ index 000000000..05adc7f99
 +/// previous job's work can continue after its completion callback).
 +/// Counters: [waits, total ns, max ns] for debugfs.
 +pub(crate) static G15_TEARDOWN_AGE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
++
++/// Renders whose 3D pass ran partial renders, and the partials they ran
++/// (debugfs).
++pub(crate) static G15_PARTIALS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
++
++/// Teardown claims, queue then Vm: [claims, smallest ns since the last
++/// job's completion, claims under 500 us, claims under 2 ms] (debugfs).
++pub(crate) static G15_TEARDOWN_GAP: [[AtomicU64; 4]; 2] = [
++    [AtomicU64::new(0), AtomicU64::new(u64::MAX), AtomicU64::new(0), AtomicU64::new(0)],
++    [AtomicU64::new(0), AtomicU64::new(u64::MAX), AtomicU64::new(0), AtomicU64::new(0)],
++];
++
++/// Record how long after the last job's completion a teardown (`who`: 0
++/// queue, 1 Vm) took the job slot.
++pub(crate) fn g15_note_teardown_gap(who: usize) {
++    let fin = G15_T_LAST_FIN.load(Ordering::Acquire);
++    let Some(g) = G15_TEARDOWN_GAP.get(who) else {
++        return;
++    };
++    if fin == 0 {
++        return;
++    }
++    let gap = g15_now_ns().saturating_sub(fin);
++    g[0].fetch_add(1, Ordering::Relaxed);
++    g[1].fetch_min(gap, Ordering::Relaxed);
++    if gap < 500_000 {
++        g[2].fetch_add(1, Ordering::Relaxed);
++    }
++    if gap < 2_000_000 {
++        g[3].fetch_add(1, Ordering::Relaxed);
++    }
++}
 +
 +pub(crate) fn g15_wait_teardown_age() {
 +    let age = u64::from((*module_parameters::g15_teardown_age_us.value()).min(10_000)) * 1000;
@@ -34101,7 +34202,7 @@ index 000000000..05adc7f99
 +        G15_TEARDOWN_AGE[0].fetch_add(1, Ordering::Relaxed);
 +        G15_TEARDOWN_AGE[1].fetch_add(ready - now, Ordering::Relaxed);
 +        G15_TEARDOWN_AGE[2].fetch_max(ready - now, Ordering::Relaxed);
-+        kernel::time::delay::udelay(kernel::time::Delta::from_micros((ready - now).div_ceil(1000) as i64));
++        g15_sleep_until(ready);
 +    }
 +}
 +
@@ -34165,6 +34266,10 @@ index 000000000..05adc7f99
 +            matches!(s, Some(Ok(s)) if s.doneptr == s.wptr)
 +        };
 +        let verified = self.error.is_none() && retired(&ta_state) && retired(&frag_state);
++        if self.frag_partials > 0 {
++            G15_PARTIALS[0].fetch_add(1, Ordering::Relaxed);
++            G15_PARTIALS[1].fetch_add(u64::from(self.frag_partials), Ordering::Relaxed);
++        }
 +        if self.error.is_some() || crate::debug::g15_verbose() {
 +        dev_info!(
 +            self.dev.as_ref(),
@@ -35142,6 +35247,7 @@ index 000000000..05adc7f99
 +                (&ta_leases, &frag_leases),
 +                &payload,
 +                user.user_regs(),
++                user.long_lists(),
 +                &mut _m_pair,
 +            )?;
 +            let vm_slot = job.vm_bind.slot();
@@ -35550,6 +35656,7 @@ index 000000000..05adc7f99
 +        ),
 +        payload: &G15PayloadRefs,
 +        user_regs: Option<&crate::render_input::G15UserRegFields>,
++        long_lists: bool,
 +        m_pair: &mut Option<G15StageMark>,
 +    ) -> Result<(
 +        KBox<super::g15_render::G15RenderPair>,
@@ -35559,7 +35666,7 @@ index 000000000..05adc7f99
 +        #[ver(G != G15)]
 +        {
 +            let _ = (job, gpu, kp, profile, res, queue_res, timing, ta_leases, frag_leases);
-+            let _ = (payload, user_regs, m_pair);
++            let _ = (payload, user_regs, long_lists, m_pair);
 +            return Err(ENODEV);
 +        }
 +
@@ -35653,6 +35760,33 @@ index 000000000..05adc7f99
 +                            reg: fw::g15_render::G15RegRef { engine, reg },
 +                            value: slot,
 +                            mask: u64::MAX,
++                        },
++                        GFP_KERNEL,
++                    )?;
++                }
++                // G2 (`g15_frag_15021_bit0`, default 0): native long-list
++                // renders have 0x15021 bit 0 clear; with it set (the profile's
++                // 0xc001, from small native renders) a tile list past byte 0x40
++                // of its chunk times out. The JobParameters3 +0x9c0 mirror
++                // follows the override. Native uses 0xc001 only on small
++                // warm-up renders: 3 clears the bit only on renders Mesa marks
++                // DRM_ASAHI_RENDER_G15_LONG_LISTS, 4 keeps the profile's value
++                // on each queue's first render.
++                let bit0 = match *module_parameters::g15_frag_15021_bit0.value() {
++                    v @ (0 | 1) => Some(v),
++                    3 => long_lists.then_some(0),
++                    4 => (counter_frag != 0).then_some(0),
++                    _ => None,
++                };
++                if let Some(bit0) = bit0 {
++                    v.push(
++                        fw::g15_render::G15RegOverride {
++                            reg: fw::g15_render::G15RegRef {
++                                engine: fw::g15_render::G15Engine::Frag,
++                                reg: 0x15021,
++                            },
++                            value: bit0.into(),
++                            mask: 1,
 +                        },
 +                        GFP_KERNEL,
 +                    )?;
@@ -38900,7 +39034,7 @@ index 000000000..e33e40e44
 +    }
 +}
 diff --git a/drivers/gpu/drm/asahi/queue/mod.rs b/drivers/gpu/drm/asahi/queue/mod.rs
-index 85da1d539..e300575f4 100644
+index 85da1d539..a1369ff59 100644
 --- a/drivers/gpu/drm/asahi/queue/mod.rs
 +++ b/drivers/gpu/drm/asahi/queue/mod.rs
 @@ -9,15 +9,23 @@
@@ -38927,7 +39061,7 @@ index 85da1d539..e300575f4 100644
      xarray, //
  };
  
-@@ -46,17 +54,457 @@
+@@ -46,17 +54,459 @@
      workqueue, //
  };
  
@@ -39060,6 +39194,7 @@ index 85da1d539..e300575f4 100644
 +        gate: &Arc<Self>,
 +        max_ms: u32,
 +        gpu_fail_stopped: &dyn Fn() -> bool,
++        who: usize,
 +    ) -> Option<G15JobSlot> {
 +        G15_TEARDOWN_CLAIMS.fetch_add(1, Ordering::Relaxed);
 +        for waited in 0..=max_ms {
@@ -39080,6 +39215,7 @@ index 85da1d539..e300575f4 100644
 +                    }
 +                    let slot = G15JobSlot(gate.clone());
 +                    core::mem::drop(busy);
++                    g15_render_job::g15_note_teardown_gap(who);
 +                    // Slot held: let the last job's tail finish first.
 +                    g15_render_job::g15_wait_teardown_age();
 +                    return Some(slot);
@@ -39385,7 +39521,7 @@ index 85da1d539..e300575f4 100644
  mod render;
  
  /// Trait implemented by all versioned queues.
-@@ -69,10 +517,26 @@ fn submit(
+@@ -69,10 +519,26 @@ fn submit(
          cmdbuf_raw: &[u8],
          objects: Pin<&xarray::XArray<KBox<file::Object>>>,
      ) -> Result;
@@ -39412,7 +39548,7 @@ index 85da1d539..e300575f4 100644
      wq: Arc<workqueue::WorkQueue::ver>,
  }
  
-@@ -117,6 +581,413 @@ fn can_submit(&self) -> Option<Fence> {
+@@ -117,6 +583,413 @@ fn can_submit(&self) -> Option<Fence> {
      }
  }
  
@@ -39826,7 +39962,7 @@ index 85da1d539..e300575f4 100644
  #[versions(AGX)]
  pub(crate) struct Queue {
      dev: AsahiDevRef,
-@@ -127,7 +998,13 @@ pub(crate) struct Queue {
+@@ -127,7 +1000,13 @@ pub(crate) struct Queue {
      q_frag: Option<SubQueue::ver>,
      q_comp: Option<SubQueue::ver>,
      fence_ctx: FenceContexts,
@@ -39841,7 +39977,7 @@ index 85da1d539..e300575f4 100644
  }
  
  #[versions(AGX)]
-@@ -140,8 +1017,96 @@ pub(crate) struct QueueInner {
+@@ -140,8 +1019,96 @@ pub(crate) struct QueueInner {
      notifier: Arc<GpuObject<fw::event::Notifier::ver>>,
      usc_exec_base: u64,
      id: u64,
@@ -39938,7 +40074,7 @@ index 85da1d539..e300575f4 100644
  }
  
  #[versions(AGX)]
-@@ -168,37 +1133,1197 @@ fn command_complete(self: &FenceObject<Self>) {
+@@ -168,37 +1135,1197 @@ fn command_complete(self: &FenceObject<Self>) {
              mod_pr_debug!("JobFence[{}]: Signaling\n", self.id);
              self.signal();
          }
@@ -41164,7 +41300,7 @@ index 85da1d539..e300575f4 100644
      fn get_vtx(&mut self) -> Result<&mut workqueue::Job::ver> {
          self.sj_vtx
              .as_mut()
-@@ -244,6 +2369,66 @@ impl sched::JobImpl for QueueJob::ver {
+@@ -244,6 +2371,66 @@ impl sched::JobImpl for QueueJob::ver {
      fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
          mod_dev_dbg!(job.dev, "QueueJob {}: Checking runnability\n", job.id);
  
@@ -41231,7 +41367,7 @@ index 85da1d539..e300575f4 100644
          if let Some(sj) = job.sj_vtx.as_ref() {
              if let Some(fence) = sj.can_submit() {
                  mod_dev_dbg!(
-@@ -281,6 +2466,33 @@ fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
+@@ -281,6 +2468,33 @@ fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
      fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
          mod_dev_dbg!(job.dev, "QueueJob {}: Running Job\n", job.id);
  
@@ -41265,7 +41401,7 @@ index 85da1d539..e300575f4 100644
          // We can only increase the notifier threshold here, now that we are
          // actually running the job. We cannot increase it while queueing the
          // job without introducing subtle race conditions. Suppose we did, as
-@@ -325,8 +2537,22 @@ fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
+@@ -325,8 +2539,22 @@ fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
          // are "invisible" to the firmware. Incrementing the notifier threshold
          // earlier than this violates that which leads to circles like the
          // above. Deferring the increment to submit solves the race.
@@ -41289,7 +41425,7 @@ index 85da1d539..e300575f4 100644
          });
  
          let gpu = match (*job.dev)
-@@ -342,6 +2568,164 @@ fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
+@@ -342,6 +2570,164 @@ fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
              }
          };
  
@@ -41454,7 +41590,7 @@ index 85da1d539..e300575f4 100644
          if job.op_guard.is_none() {
              job.op_guard = Some(gpu.start_op()?);
          }
-@@ -407,6 +2791,12 @@ fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+@@ -407,6 +2793,12 @@ fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
              "QueueJob {}: Job timed out on the DRM scheduler, things will probably break (ran: {})\n",
              job.id, job.did_run
          );
@@ -41467,7 +41603,7 @@ index 85da1d539..e300575f4 100644
          sched::Status::NoDevice
      }
  
-@@ -439,12 +2829,26 @@ pub(crate) fn new(
+@@ -439,12 +2831,26 @@ pub(crate) fn new(
          alloc: &mut gpu::KernelAllocators,
          ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
          ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
@@ -41494,7 +41630,7 @@ index 85da1d539..e300575f4 100644
          mod_dev_dbg!(dev, "[Queue {}] Creating queue\n", id);
  
          // Must be shared, no cache management on this one!
-@@ -475,13 +2879,105 @@ pub(crate) fn new(
+@@ -475,13 +2881,105 @@ pub(crate) fn new(
  
          // Priorities are handled by the AGX scheduler, there is no meaning within a
          // per-queue scheduler. Use a single run queue wth Kernel priority.
@@ -41602,7 +41738,7 @@ index 85da1d539..e300575f4 100644
          let mut ret = Queue::ver {
              dev: dev.into(),
              _sched: sched,
-@@ -491,7 +2987,7 @@ pub(crate) fn new(
+@@ -491,7 +2989,7 @@ pub(crate) fn new(
              q_frag: None,
              q_comp: None,
              fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
@@ -41611,7 +41747,7 @@ index 85da1d539..e300575f4 100644
                  dev: dev.into(),
                  ualloc,
                  gpu_context: Arc::new(
-@@ -504,23 +3000,94 @@ pub(crate) fn new(
+@@ -504,23 +3002,94 @@ pub(crate) fn new(
                  notifier,
                  usc_exec_base,
                  id,
@@ -41710,7 +41846,7 @@ index 85da1d539..e300575f4 100644
                  channel::PipeType::Vertex,
                  id,
                  priority,
-@@ -528,13 +3095,26 @@ pub(crate) fn new(
+@@ -528,13 +3097,26 @@ pub(crate) fn new(
              )?,
          });
  
@@ -41737,7 +41873,7 @@ index 85da1d539..e300575f4 100644
                  channel::PipeType::Fragment,
                  id,
                  priority,
-@@ -542,14 +3122,33 @@ pub(crate) fn new(
+@@ -542,14 +3124,33 @@ pub(crate) fn new(
              )?,
          });
  
@@ -41772,7 +41908,7 @@ index 85da1d539..e300575f4 100644
                  channel::PipeType::Compute,
                  id,
                  priority,
-@@ -560,6 +3159,385 @@ pub(crate) fn new(
+@@ -560,6 +3161,385 @@ pub(crate) fn new(
          mod_dev_dbg!(dev, "[Queue {}] Queue created\n", id);
          Ok(ret)
      }
@@ -42158,7 +42294,7 @@ index 85da1d539..e300575f4 100644
  }
  
  const SQ_RENDER: usize = 0;
-@@ -608,6 +3586,33 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
+@@ -608,6 +3588,33 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
  
  #[versions(AGX)]
  impl Queue for Queue::ver {
@@ -42192,7 +42328,7 @@ index 85da1d539..e300575f4 100644
      fn submit(
          &mut self,
          id: u64,
-@@ -616,6 +3621,10 @@ fn submit(
+@@ -616,6 +3623,10 @@ fn submit(
          cmdbuf_raw: &[u8],
          objects: Pin<&xarray::XArray<KBox<file::Object>>>,
      ) -> Result {
@@ -42203,7 +42339,7 @@ index 85da1d539..e300575f4 100644
          let gpu = match (*self.dev)
              .gpu
              .clone()
-@@ -640,6 +3649,88 @@ fn submit(
+@@ -640,6 +3651,88 @@ fn submit(
              return Err(ENODEV);
          }
  
@@ -42292,7 +42428,7 @@ index 85da1d539..e300575f4 100644
          let op_guard = if in_sync_count > 0 {
              Some(gpu.start_op()?)
          } else {
-@@ -702,35 +3793,69 @@ fn submit(
+@@ -702,35 +3795,69 @@ fn submit(
  
              match header.cmd_type as u32 {
                  uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
@@ -42378,7 +42514,7 @@ index 85da1d539..e300575f4 100644
                  fence,
                  notifier: self.inner.notifier.clone(),
  
-@@ -742,8 +3867,8 @@ fn submit(
+@@ -742,8 +3869,8 @@ fn submit(
  
                  did_run: false,
                  id,
@@ -42389,7 +42525,7 @@ index 85da1d539..e300575f4 100644
  
          mod_dev_dbg!(
              self.dev,
-@@ -772,8 +3897,15 @@ fn submit(
+@@ -772,8 +3899,15 @@ fn submit(
          cmdbuf.rewind();
  
          let mut command_index = 0;
@@ -42405,7 +42541,7 @@ index 85da1d539..e300575f4 100644
          let mut compute_attachments: microseq::Attachments = Default::default();
  
          // Parse the full command buffer submitting as we go
-@@ -788,6 +3920,19 @@ fn submit(
+@@ -788,6 +3922,19 @@ fn submit(
                  if *index == uapi::DRM_ASAHI_BARRIER_NONE as u16 {
                      continue;
                  }
@@ -42425,7 +42561,7 @@ index 85da1d539..e300575f4 100644
                  if let Some(event) = events[queue_idx].get(*index as usize).ok_or_else(|| {
                      cls_pr_debug!(Errors, "Invalid barrier #{}: {}\n", queue_idx, index);
                      EINVAL
-@@ -800,12 +3945,14 @@ fn submit(
+@@ -800,12 +3947,14 @@ fn submit(
                      };
                      mod_dev_dbg!(self.dev, "[Submission {}] Create Explicit Barrier\n", id);
                      let barrier = alloc.private.new_init(
@@ -42442,7 +42578,7 @@ index 85da1d539..e300575f4 100644
                                  wait_value: event.value,
                                  wait_slot: event.slot,
                                  stamp_self: queue_job.event_info().value.next(),
-@@ -827,6 +3974,28 @@ fn submit(
+@@ -827,6 +3976,28 @@ fn submit(
                  uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                      let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(header_size)?;
  
@@ -42471,7 +42607,7 @@ index 85da1d539..e300575f4 100644
                      self.inner.submit_render(
                          &mut job,
                          &render,
-@@ -852,6 +4021,9 @@ fn submit(
+@@ -852,6 +4023,9 @@ fn submit(
                  uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
                      let compute: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(header_size)?;
  
@@ -42481,7 +42617,7 @@ index 85da1d539..e300575f4 100644
                      self.inner.submit_compute(
                          &mut job,
                          &compute,
-@@ -873,14 +4045,36 @@ fn submit(
+@@ -873,14 +4047,36 @@ fn submit(
                          GFP_KERNEL,
                      )?;
                  }
@@ -42521,7 +42657,7 @@ index 85da1d539..e300575f4 100644
                  }
                  _ => {
                      cls_pr_debug!(Errors, "Unknown command type {}\n", header.cmd_type);
-@@ -897,6 +4091,15 @@ fn submit(
+@@ -897,6 +4093,15 @@ fn submit(
          );
          job.commit()?;
  
@@ -42537,7 +42673,7 @@ index 85da1d539..e300575f4 100644
          mod_dev_dbg!(self.dev, "Queue {}: Arming job {}\n", self.inner.id, job.id);
          let mut job = job.arm();
          let out_fence = job.fences().finished();
-@@ -931,5 +4134,135 @@ fn submit(
+@@ -931,5 +4136,135 @@ fn submit(
  impl Drop for Queue::ver {
      fn drop(&mut self) {
          mod_dev_dbg!(self.dev, "[Queue {}] Dropping queue\n", self.inner.id);
@@ -42559,7 +42695,7 @@ index 85da1d539..e300575f4 100644
 +            let max_ms = G15_TEARDOWN_WAIT_MAX_MS;
 +            let dev = self.dev.clone();
 +            self.g15_teardown_slot =
-+                G15JobGate::claim_for_teardown(&self.dev.g15_job_gate, max_ms, &|| dev.gpu.is_crashed());
++                G15JobGate::claim_for_teardown(&self.dev.g15_job_gate, max_ms, &|| dev.gpu.is_crashed(), 0);
 +            // No slot (timeout, or a fail-stopped GPU that may still run an
 +            // uncancelable job): send no firmware command and retain every
 +            // firmware-visible resource.

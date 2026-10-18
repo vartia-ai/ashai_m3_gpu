@@ -944,7 +944,7 @@ index e67e354..e0a17d1 100644
        fprintf(stderr, "AGX_BO_LABEL fd=%d handle=%u flags=%u size=%zu label=%s\n",
                dev->fd, bo->uapi_handle, bo->flags, bo->size, label);
 diff --git a/src/asahi/lib/agx_device.c b/src/asahi/lib/agx_device.c
-index c972844..799d42c 100644
+index c972844..17e2edc 100644
 --- a/src/asahi/lib/agx_device.c
 +++ b/src/asahi/lib/agx_device.c
 @@ -6,6 +6,8 @@
@@ -1079,7 +1079,7 @@ index c972844..799d42c 100644
        dev->usc_heap.alloc_high = false;
  
     dev->vm_id = vm_create.vm_id;
-@@ -771,10 +829,54 @@ agx_open_device(void *memctx, struct agx_device *dev)
+@@ -771,10 +829,56 @@ agx_open_device(void *memctx, struct agx_device *dev)
  
     /* Apple9 GPUs require their generation-specific graphics path. */
     dev->apple9_direct_render =
@@ -1114,19 +1114,21 @@ index c972844..799d42c 100644
 +    * (n6-z16); ASAHI_G15_Z16=0 refuses Z16 targets. */
 +   dev->g15_z16 = dev->g15_graphics && !(g15_z16 && !strcmp(g15_z16, "0"));
 +   const char *mesa_partial = getenv("ASAHI_G15_MESA_PARTIAL");
++   /* The built-in G15 profile has no executable partial-render programs.
++    * Use Mesa's reload/store helpers by default; 0 keeps the captured
++    * programs for diagnostics with an installed bridge bundle. */
 +   dev->g15_mesa_partial =
-+      dev->g15_graphics && mesa_partial && !strcmp(mesa_partial, "1");
++      dev->g15_graphics && !(mesa_partial && !strcmp(mesa_partial, "0"));
 +   const char *batch_prims = getenv("ASAHI_G15_BATCH_PRIMS");
-+   /* 32: a full-panel glmark2 run had 275 recovered tile-list timeouts at
-+    * 128 and none at 32 (dense meshes stack primitives per tile). */
-+   dev->g15_batch_prims = batch_prims ? MAX2(atoi(batch_prims), 1) : 32;
++   /* No cap by default: with the kernel's Fragment 0x15021 bit 0 clear and
++    * Mesa's partial programs, uncapped glmark2 runs every scene with 0
++    * errors (score 468 against 91 at 32 primitives, f1fix-001330), and one
++    * 262,144-triangle render retires four exact partials (f2grid-005247).
++    * ASAHI_G15_BATCH_PRIMS=N caps renders at N primitives (diagnostics). */
++   dev->g15_batch_prims = batch_prims ? atoi(batch_prims) : 0;
 +   const char *batch_draws = getenv("ASAHI_G15_BATCH_DRAWS");
-+   /* 8: with the kernel's PB descriptor slot fix and per-list relinker,
-+    * Hyprland (foot, simple-egl, glmark windowed) runs 0 errors at 2, 4 and
-+    * 8 draws of at most 32 primitives and reaches 60 fps at 8; 16 draws
-+    * time out (capsweep3-225920). Weston's earlier failure at 2 or 4 draws
-+    * predates the slot fix. */
-+   dev->g15_batch_draws = batch_draws ? atoi(batch_draws) : 8;
++   /* No cap either; ASAHI_G15_BATCH_DRAWS=N ends a render after N draws. */
++   dev->g15_batch_draws = batch_draws ? atoi(batch_draws) : 0;
 +   const char *long_list_prims = getenv("ASAHI_G15_LONG_LIST_PRIMS");
 +   /* 50: 50 full-target triangles keep every tile list within byte 0x40 at
 +    * 1280..2560 wide; 51 cross it. */
@@ -1137,7 +1139,7 @@ index c972844..799d42c 100644
        simple_mtx_init(&dev->apple9_entry_lock, mtx_plain);
        util_vma_heap_init(&dev->apple9_entry_heap, AGX_APPLE9_ENTRY_HEADER_SIZE,
                          AGX_APPLE9_ENTRY_ARENA_SIZE - AGX_APPLE9_ENTRY_HEADER_SIZE);
-@@ -787,7 +889,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
+@@ -787,7 +891,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
                         AGX_BO_EXEC | AGX_BO_LOW_VA | AGX_BO_WRITEBACK |
                            AGX_BO_READONLY, "Apple9 shader entries");
        if (!dev->apple9_entries ||
@@ -1146,7 +1148,7 @@ index c972844..799d42c 100644
           fprintf(stderr, "Failed to reserve compact Apple9 shader entries\n");
           return false;
        }
-@@ -851,7 +953,8 @@ agx_close_device(struct agx_device *dev)
+@@ -851,7 +955,8 @@ agx_close_device(struct agx_device *dev)
     agx_bo_unreference(dev, dev->scratch_bo);
     u_printf_destroy(&dev->printf);
     agx_bo_cache_evict_all(dev);
@@ -1156,7 +1158,7 @@ index c972844..799d42c 100644
        util_vma_heap_finish(&dev->apple9_entry_heap);
        simple_mtx_destroy(&dev->apple9_entry_lock);
     }
-@@ -871,7 +974,13 @@ agx_create_command_queue(struct agx_device *dev,
+@@ -871,7 +976,13 @@ agx_create_command_queue(struct agx_device *dev,
                           enum drm_asahi_priority priority)
  {
  
@@ -1171,7 +1173,7 @@ index c972844..799d42c 100644
        // Abuse this lock for this, it's debug only anyway
        simple_mtx_lock(&dev->vma_lock);
        if (dev->queue_id) {
-@@ -893,7 +1002,7 @@ agx_create_command_queue(struct agx_device *dev,
+@@ -893,7 +1004,7 @@ agx_create_command_queue(struct agx_device *dev,
        assert(0);
     }
  
@@ -1180,7 +1182,7 @@ index c972844..799d42c 100644
        dev->queue_id = queue_create.queue_id;
        simple_mtx_unlock(&dev->vma_lock);
     }
-@@ -904,7 +1013,7 @@ agx_create_command_queue(struct agx_device *dev,
+@@ -904,7 +1015,7 @@ agx_create_command_queue(struct agx_device *dev,
  int
  agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id)
  {
@@ -1189,7 +1191,7 @@ index c972844..799d42c 100644
        return 0;
  
     struct drm_asahi_queue_destroy queue_destroy = {
-@@ -1084,7 +1193,7 @@ agx_gather_device_key(struct agx_device *dev)
+@@ -1084,7 +1195,7 @@ agx_gather_device_key(struct agx_device *dev)
                     dev->params.num_dies > 1;
  
     return (struct agx_device_key){
@@ -1199,10 +1201,10 @@ index c972844..799d42c 100644
                         : AGX_SHADER_ISA_APPLE8,
        .needs_g13x_coherency = u_tristate_make(g13x_coh),
 diff --git a/src/asahi/lib/agx_device.h b/src/asahi/lib/agx_device.h
-index ec7ff77..1340055 100644
+index ec7ff77..791d2de 100644
 --- a/src/asahi/lib/agx_device.h
 +++ b/src/asahi/lib/agx_device.h
-@@ -103,6 +103,41 @@ struct agx_device {
+@@ -103,6 +103,40 @@ struct agx_device {
     /* Environment options captured at device creation, immutable while in use. */
     bool apple9_direct_render;
     bool apple9_trace;
@@ -1229,13 +1231,12 @@ index ec7ff77..1340055 100644
 +   bool g15_depthonly;
 +   /* Z16 depth targets (ASAHI_G15_Z16, default 1). */
 +   bool g15_z16;
-+   /* ASAHI_G15_MESA_PARTIAL=1: Mesa's reload/store as the partial-render
-+    * background and end-of-tile programs instead of the bundle's. */
++   /* Mesa's reload/store are the G15 partial-render background/end-of-tile
++    * programs. ASAHI_G15_MESA_PARTIAL=0 selects the captured fallback. */
 +   bool g15_mesa_partial;
-+   /* Triangles per G15 bridge render (ASAHI_G15_BATCH_PRIMS, default
-+    * AGX_G15_BATCH_PRIMS). */
++   /* ASAHI_G15_BATCH_PRIMS: primitives per render, 0 = no limit (default). */
 +   unsigned g15_batch_prims;
-+   /* ASAHI_G15_BATCH_DRAWS: draws per render, 0 = no limit (default 1). */
++   /* ASAHI_G15_BATCH_DRAWS: draws per render, 0 = no limit (default). */
 +   unsigned g15_batch_draws;
 +   /* G2: renders over this many primitives may give a tile list past byte
 +    * 0x40 and are marked DRM_ASAHI_RENDER_G15_LONG_LISTS for the kernel's
@@ -2980,7 +2981,7 @@ index 0d8d00a..38b7b91 100644
        return false;
  
 diff --git a/src/gallium/drivers/asahi/agx_state.c b/src/gallium/drivers/asahi/agx_state.c
-index 2d71f53..c2ec942 100644
+index 2d71f53..43c98a7 100644
 --- a/src/gallium/drivers/asahi/agx_state.c
 +++ b/src/gallium/drivers/asahi/agx_state.c
 @@ -14,6 +14,8 @@
@@ -3289,7 +3290,7 @@ index 2d71f53..c2ec942 100644
  static void
  agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
               unsigned drawid_offset,
-@@ -6347,6 +6547,73 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+@@ -6347,6 +6547,66 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
     struct agx_device *dev = agx_device(pctx->screen);
     struct agx_screen *screen = agx_screen(pctx->screen);
  
@@ -3301,12 +3302,10 @@ index 2d71f53..c2ec942 100644
 +                 why);
 +         return;
 +      }
-+      /* A tile whose primitive list outgrows its first allocation stalls
-+       * the replayed bridge render (firmware timeout, between 128 and 192
-+       * triangles in one tile; the TVB heap path is not qualified). Keep
-+       * every render under dev->g15_batch_prims (ASAHI_G15_BATCH_PRIMS): split long triangle lists
-+       * and strips, and end the batch before a draw would pass the cap. The
-+       * next batch reloads colour and depth. */
++      /* Optional per-render caps (ASAHI_G15_BATCH_PRIMS and
++       * ASAHI_G15_BATCH_DRAWS, default none; diagnostics): split long
++       * triangle lists and strips, and end the batch before a draw would
++       * pass a cap. The next batch reloads colour and depth. */
 +      /* The reload/store helpers' own draws belong to the batch they are
 +       * prepared for: never split, flush or count them. */
 +      struct agx_batch *capped = agx_get_batch(ctx);
@@ -3316,7 +3315,8 @@ index 2d71f53..c2ec942 100644
 +                           util_format_has_stencil(
 +                              util_format_description(capped->key.zsbuf.format)) &&
 +                           !agx_g15_stencil_storable(&capped->key);
-+      if (prims > dev->g15_batch_prims && num_draws == 1 && !indirect &&
++      if (dev->g15_batch_prims && prims > dev->g15_batch_prims &&
++          num_draws == 1 && !indirect &&
 +          !split_stencil &&
 +          (info->mode == MESA_PRIM_TRIANGLES ||
 +           info->mode == MESA_PRIM_TRIANGLE_STRIP)) {
@@ -3330,13 +3330,6 @@ index 2d71f53..c2ec942 100644
 +         }
 +         return;
 +      }
-+      /* Each primitive list of a tile extends past its first allocation
-+       * after roughly 8 primitives when draws stack whole-target layers,
-+       * and that extension does not complete on Linux (partial-render
-+       * notes): N full-target quads in one render pass at 4 and time out
-+       * at 8 (5..7 untested) at every target size. Bound draws per render as well
-+       * (ASAHI_G15_BATCH_DRAWS, default 4, 0 = no limit); one draw of many
-+       * small triangles stays a single draw. */
 +      /* A multidraw recurses through util_draw_multi below, one draw at a
 +       * time; only those calls count. */
 +      /* Unless it is stored and loaded (ASAHI_G15_STENCIL=1), stencil
@@ -3349,7 +3342,8 @@ index 2d71f53..c2ec942 100644
 +                         !agx_g15_stencil_storable(&capped->key);
 +      if (num_draws == 1 && !has_stencil) {
 +         if (prims && capped->apple9_draw_count &&
-+             (capped->g15_prims + prims > dev->g15_batch_prims ||
++             ((dev->g15_batch_prims &&
++               capped->g15_prims + prims > dev->g15_batch_prims) ||
 +              (dev->g15_batch_draws &&
 +               capped->g15_draws + 1 > dev->g15_batch_draws)))
 +            agx_flush_batch_for_reason(ctx, capped, "G15 per-render primitive cap");
@@ -3363,7 +3357,7 @@ index 2d71f53..c2ec942 100644
     if (unlikely(!agx_render_condition_check(ctx)))
        return;
  
-@@ -6568,8 +6835,20 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+@@ -6568,8 +6828,20 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
  #endif
  
     agx_batch_init_state(batch);
@@ -3385,7 +3379,7 @@ index 2d71f53..c2ec942 100644
  
     /* Dirty track the reduced prim: lines vs points vs triangles. Happens before
      * agx_update_vs/agx_update_fs, which specialize based on primitive.
-@@ -6859,13 +7138,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+@@ -6859,13 +7131,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
        agx_get_scissor_extents(&ctx->viewport[0],
                                ctx->rast->base.scissor ? &ctx->scissor[0] : NULL,
                                &batch->key, &minx, &miny, &maxx, &maxy);
@@ -3409,7 +3403,7 @@ index 2d71f53..c2ec942 100644
        struct agx_scissor_packed scissor;
        float minz, maxz;
        util_viewport_zmin_zmax(&ctx->viewport[0], ctx->rast->base.clip_halfz,
-@@ -6890,6 +7172,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+@@ -6890,6 +7165,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
                  &scissor, sizeof(scissor));
        }
        record->reads_tile = pipeline.fragment.reads_tile;
@@ -3421,7 +3415,7 @@ index 2d71f53..c2ec942 100644
        record->uses_discard = pipeline.fragment.uses_discard;
        record->writes_depth = pipeline.fragment.writes_depth;
        record->disable_tri_merging = pipeline.fragment.disable_tri_merging;
-@@ -6922,7 +7209,20 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+@@ -6922,7 +7202,20 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
              agx_upload_depth_bias(batch, &ctx->rast->base);
           }
        }
@@ -3443,7 +3437,7 @@ index 2d71f53..c2ec942 100644
                                (depth_bias_enabled ? (1u << 17) : 0) |
                                (stencil_enabled ? (3u << 18) : 0);
        if (ctx->active_queries && ctx->occlusion_query) {
-@@ -7044,6 +7344,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+@@ -7044,6 +7337,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
                                     &batch->apple9_context_pool,
                                     &pipeline,
                                     record, previous)) {
@@ -3455,7 +3449,7 @@ index 2d71f53..c2ec942 100644
           fprintf(stderr, "Failed to encode Apple9 draw state\n");
           abort();
        }
-@@ -7051,8 +7356,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+@@ -7051,8 +7349,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
        ++batch->apple9_draw_count;
        pipeline.ppp = record->ppp;
        pipeline.vertex_launch = record->launch[0] / 0x40;
@@ -3473,7 +3467,7 @@ index 2d71f53..c2ec942 100644
        /* Background and EOT dispatch use these fragment entries directly.
         * A rasterized reload triangle would mark every tile as non-empty,
         * forcing attachment traffic even where the application draws nothing. */
-@@ -7061,6 +7374,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+@@ -7061,6 +7367,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
           agx_dirty_reset_graphics(ctx);
           return;
        }
@@ -3485,7 +3479,7 @@ index 2d71f53..c2ec942 100644
  
        /* Keep current at the terminator, so both another draw and a stream
         * link replace it. A newly linked buffer starts at current directly.
-@@ -7326,6 +7644,10 @@ static void
+@@ -7326,6 +7637,10 @@ static void
  agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
  {
     struct agx_context *ctx = agx_context(pipe);
@@ -3497,21 +3491,10 @@ index 2d71f53..c2ec942 100644
                  !agx_render_condition_check(ctx)))
        return;
 diff --git a/src/gallium/drivers/asahi/agx_state.h b/src/gallium/drivers/asahi/agx_state.h
-index 3015c43..88913e9 100644
+index 3015c43..8d90d24 100644
 --- a/src/gallium/drivers/asahi/agx_state.h
 +++ b/src/gallium/drivers/asahi/agx_state.h
-@@ -402,6 +402,10 @@ struct agx_encoder {
-    uint8_t *end;
- };
- 
-+/* G15: triangles per bridge render. A tile with more than about 128
-+ * overlapping triangles stalls the replayed render (see agx_draw_vbo). */
-+#define AGX_G15_BATCH_PRIMS 32
-+
- struct agx_batch {
-    struct agx_context *ctx;
-    struct pipe_framebuffer_state key;
-@@ -415,6 +419,7 @@ struct agx_batch {
+@@ -415,6 +415,7 @@ struct agx_batch {
     uint32_t clear, draw, load, resolve, feedback;
     bool initialized;
     bool apple9_color_reloaded;
@@ -3519,11 +3502,12 @@ index 3015c43..88913e9 100644
     uint32_t apple9_color_reload_launch;
     uint32_t apple9_color_store_launch;
     /* Prepare background/EOT state without emitting a rasterized draw. */
-@@ -480,6 +485,18 @@ struct agx_batch {
+@@ -480,6 +481,19 @@ struct agx_batch {
     bool apple9_render_initialized;
     struct agx_pool apple9_context_pool;
     unsigned apple9_draw_count;
-+   /* G15: primitives recorded in this batch (see AGX_G15_BATCH_PRIMS). */
++   /* G15: primitives recorded in this batch (long-list marking and
++    * ASAHI_G15_BATCH_PRIMS). */
 +   unsigned g15_prims;
 +   /* G15: draws in this batch (ASAHI_G15_BATCH_DRAWS). */
 +   unsigned g15_draws;
@@ -3538,7 +3522,7 @@ index 3015c43..88913e9 100644
     struct agx_apple9_uniform_draw apple9_previous_draw;
  
     /* Apple9 direct records appended to cdm for this command. */
-@@ -509,6 +526,10 @@ struct agx_batch {
+@@ -509,6 +523,10 @@ struct agx_batch {
     unsigned cs_preamble_scratch;
  };
  
@@ -3549,7 +3533,7 @@ index 3015c43..88913e9 100644
  struct agx_zsa {
     struct pipe_depth_stencil_alpha_state base;
     struct agx_fragment_face_packed depth;
-@@ -643,6 +664,7 @@ struct asahi_blitter {
+@@ -643,6 +661,7 @@ struct asahi_blitter {
  struct agx_oq_heap;
  
  struct agx_context {
@@ -3557,7 +3541,7 @@ index 3015c43..88913e9 100644
     struct pipe_context base;
     struct agx_compiled_shader *vs, *fs, *gs, *tcs;
     struct {
-@@ -764,6 +786,9 @@ struct agx_context {
+@@ -764,6 +783,9 @@ struct agx_context {
     struct agx_scratch scratch_vs;
     struct agx_scratch scratch_fs;
     struct agx_scratch scratch_cs;
@@ -3567,7 +3551,7 @@ index 3015c43..88913e9 100644
  };
  
  static inline unsigned
-@@ -1251,6 +1276,8 @@ void agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
+@@ -1251,6 +1273,8 @@ void agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
  
  void agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info);
  bool agx_apple9_reload_color(struct agx_batch *batch);

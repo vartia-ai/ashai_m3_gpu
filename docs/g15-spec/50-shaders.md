@@ -167,10 +167,12 @@ values; native high bits [NATIVE]; meaning [UNKNOWN]
 
 ## 7. Partial-render programs
 
-Mesa currently assigns its normal colour reload helper to `partial_bg` and its
-normal colour store helper to `partial_eot`. The kernel places those programs
-in the G15 partial slots in `RunFragment`. [HW] for field plumbing; partial
-execution with Mesa programs [UNKNOWN]
+Mesa assigns its normal colour reload helper to `partial_bg` and its normal
+colour store helper to `partial_eot`. The kernel places those programs in the
+G15 partial slots in `RunFragment`. This is the default.
+`ASAHI_G15_MESA_PARTIAL=0` instead selects the captured macOS programs'
+addresses; no program payload is included, so with the built-in profile
+those addresses are unbacked and fault. [HW]
 
 Native captures show that partial EOT aliases normal EOT in every qualified
 case. Partial BG aliases normal BG for a depth Load pass and can differ for a
@@ -180,25 +182,19 @@ A native 513x257 pressure job completes four partial renders and preserves the
 entire colour and D32F result. It uses the fixed TVB without a GrowTVB request
 or acknowledgement. [NATIVE]
 
-No Linux job has yet retired with a positive G15 partial count. Uncapped
-visible geometry reaches the fragment pass, loses one 32x32 tile and times
-out before reporting a partial; the same pre-publication command image
-completes at the lower geometry count. Bundle and Mesa partial programs fail
-identically. [HW]
+On Linux, with Mesa's programs, one render of 262,144 triangles over a 128x128
+D32F grid runs four partial renders and its colour and depth match the
+oracle exactly; 5,000 full-panel triangles in one draw run 72 partial renders
+over three frames with every pixel exact. [HW]
 
-The corresponding clipped workload, which carries the same vertex count and
-varying footprint without visible raster output, completes exactly. A live
-derivative that disables triangle merging does not change the visible-stress
-failure. The remaining boundary is runtime TA output consumed by Fragment,
-not a qualified shader or launch-record difference. [HW] for the A/B results;
-boundary [INFERRED]
+Earlier Linux runs never retired a partial render: their renders hung at the
+per-tile list limit first (fixed; see
+[Known limits](70-known-limits.md)). [HW]
 
 ## 8. Open questions
 
 | Question | Tag |
 |---|---|
-| Which Linux TVB, PM, page-list or UMA state prevents the first partial render from retiring? | [UNKNOWN] |
-| Do Mesa's partial reload/store helpers preserve exact colour and depth once Linux retires a positive partial? | [UNKNOWN] |
 | What are the complete G15 Apple9 opcode, system-register and scheduling differences from G16/G17? | [UNKNOWN] |
 | What are the G15 hardware limits for publications, varyings, resource tables and launch allocation? | [UNKNOWN] |
 | Which launch control fields differ by stage beyond the values already observed? | [UNKNOWN] |

@@ -1,107 +1,96 @@
 # Known limits and open problems
 
-What the demo driver does not do yet, why, and what is known about the cause.
+What the driver does not do yet, why, and what is known about the cause.
 Facts are tagged as in the [README](README.md).
 
 ## What works (for context)
 
 | Measure (MacBook Air M3, 2560x1664) | G15 | llvmpipe (CPU) | Tag |
 |---|---|---|---|
-| Hyprland + `weston-simple-egl` | 57-60 fps | 59-60 fps | [HW] |
-| glmark2 texture scene | 113 | 112 | [HW] |
-| glmark2 full run (offscreen), score | 91 | | [HW] |
-| Whole-system CPU busy, Hyprland + simple-egl | 3% | 15% | [HW] |
-| Whole-system CPU busy, Hyprland + glmark2 windowed | 11% | 47% | [HW] |
-| Desktop GL piglit list | 305 / 306 | | [HW] |
-| One-hour soak (compositor + clients) | 873,352 jobs, 0 errors | | [HW] |
+| glmark2 full run (offscreen), score | 443 | | [HW] |
+| glmark2 in a Weston window, 7 scenes, score | 343 | 151 | [HW] |
+| glmark2 Gouraud-shaded mesh (offscreen run) | 479 fps | | [HW] |
+| Desktop GL piglit list | 306 / 306 | | [HW] |
+| One-hour Hyprland soak (compositor + clients) | 676,080 jobs, 0 errors | | [HW] |
+| Fresh GL processes in a row (one test each) | 1,000 without an error | | [HW] |
 
-## 1. Mesh-heavy scenes are slow
+## 1. The per-tile list limit ("64-byte cliff", G2) — fixed
 
-| Measure | G15 | llvmpipe | Tag |
-|---|---|---|---|
-| glmark2 Gouraud-shaded mesh (cat/horse models) | 2-3 fps | 82-95 fps | [HW] |
+**Symptom (before the fix).** On Linux, a tile whose primitive list ran past
+byte 0x40 of a 128-byte chunk hung the fragment pass: the firmware parked in
+its wait on unit 1, no pixel of that tile was shaded, and it reported
+`Timeout`. One 128x128 tile passed with 160 stacked triangles and hung with
+168; macOS ran the same work, with byte-identical lists, up to x1000 [HW]
+[NATIVE].
 
-**Why.** Mesa splits every render into small pieces: at most 32 primitives
-and 8 draws (`ASAHI_G15_BATCH_PRIMS`, `ASAHI_G15_BATCH_DRAWS`). A
-few-thousand-triangle mesh becomes 100+ GPU renders per frame, each with a
-fixed per-job cost of roughly 0.7-0.8 ms on the kernel/firmware side. Larger
-renders are not safe because of the per-tile list limit (section 2).
-Raising the cap alone does not help: at 64 primitives mesh renders are clean
-but barely faster; from 128 upward they start to time out (glmark2 shading
-and build, caps 32/64/128/256/1024: errors 0/0/4/116/189) [HW].
+**Cause.** Bit 0 of the Fragment ISP control word `0x15021`. The driver's
+built-in render profile used `0xc001`, the value macOS sends for small
+renders; macOS's long-list renders use `0xc000`. Moving only that bit moves
+the failure both ways: macOS's own long-list job hangs on Linux with
+`0xc001`, and Mesa's renders pass with `0xc000` [HW] [NATIVE]. What the bit
+selects inside the fragment pass is not known [UNKNOWN].
 
-**What fails above the cap.** Renders whose busiest tile accumulates more than
-64 bytes of primitive list. A deterministic reproducer is three overlapping
-256-triangle grid draws in one render (60 of 60 frames time out) [HW]. Each
-failure is a recovered firmware timeout; the client continues.
+**Fix.** The kernel clears bit 0 in every render
+(`g15_frag_15021_bit0`, default 0). Mesa's per-render primitive and draw caps
+and the kernel's list relinker, both workarounds for this limit, are off by
+default; the relinker remains as `g15_relink=1|2` for diagnostics [HW].
 
-## 2. The per-tile list limit ("64-byte cliff", G2) — open
+## 2. Partial renders — working
 
-**Symptom.** The tile accelerator (TA) writes each tile's primitive list into
-128-byte chunks. On Linux, when a tile's list runs past byte 0x40 of a chunk
-without a link, the fragment pass never finishes that tile and the firmware
-reports a timeout. One 128x128 tile passes with 160 stacked triangles (list
-ends at 0x3f) and hangs with 168 (ends at 0x43); full-panel overdraw passes
-at 50 quads and hangs at 56 [HW]. macOS runs the same work, with
-byte-identical lists, up to x1000 [NATIVE]. Details: [Render jobs,
-section 9](30-render.md#9-tile-lists-and-the-per-tile-list-limit-g2).
+When the tiler fills its buffer in the middle of a render, the firmware runs a
+partial render: it stores the tiles so far with the partial end-of-tile
+program and reloads them with the partial background program. Mesa's own
+reload and store programs serve as both; the kernel places them in
+`RunFragment`'s partial slots [HW].
 
-**Workaround in the driver (relinker).** Mesa marks renders that may produce
-long lists. For those, the kernel waits for the TA, then rewrites every list
-that runs past 0x40 into chunks that end by +0x38 with a link to a fresh
-chunk. The fragment pass consumes those exactly (hotspot x168/x192/x1000 and
-overdraw x56/x200 pass in one render) [HW].
+| Test | Result | Tag |
+|---|---|---|
+| One render of 262,144 triangles over a 128x128 D32F grid | 4 partial renders, colour and depth exact (macOS also runs 4 for this job) | [HW] [NATIVE] |
+| 5,000 full-panel triangles in one draw, 3 frames | 72 partial renders, every pixel exact | [HW] |
+| glmark2 with no per-render cap | completes; 1,700+ renders ran partials, 0 errors | [HW] |
 
-**Why the workaround does not lift the mesh cap.** The relinker reads the
-TA's output from the CPU. After a queue's first render, that output is
-usually not in memory when the TA completes: the GPU keeps the tilemap, TPC
-and even the list chunks in a write-back cache that the CPU cannot see. The
-GPU's page-table entry and the CPU view resolve to the same physical page,
-and both a cached and a non-cacheable CPU read return zeros, while the
-fragment pass still draws the correct image [HW]. How much reaches memory
-varies between identical runs. A full GPU TLB invalidate after the TA,
-another GPU context running in between, and the firmware's resource-release
-command (DeviceControl 0x11) do not write it back [HW] [STATIC]. So the
-relinker cannot see later renders' long lists, leaves them alone, and those
-renders hang. No GPU cache write-back primitive is known.
+`ASAHI_G15_MESA_PARTIAL=0` selects the captured macOS partial programs'
+addresses instead, as a diagnostic; no program payload is included, so with
+the built-in profile those addresses are unbacked and fault [HW].
 
-**What has been excluded as the macOS/Linux difference** (each tested on
-hardware or proven equal to macOS):
+## 3. Hangs the firmware does not report
 
-- Every per-render input: TA/3D register lists, full command bodies,
-  VDM/PPP words, shaders (macOS's compiled fragment shader swapped in), tile
-  programs, coefficient tables, TVB/tilemap/TPC/heapmeta layout and VAs,
-  block IDs, PTE classes, context-switch buffers (all-zero on both).
-- Device setup: InitData, HwDataA/HwDataB, the boot-patch table, firmware
-  image, the DeviceControl startup stream, PMP mailbox transcript and
-  registry values, DCS/fabric/power setup, memory-cache (MCC) data streams
-  for the GPU (macOS requests size 0), and CPU writes into the GPU's MMIO
-  (traced from macOS's first instruction: only the 24 fabric words Linux
-  also writes). The macOS GPU kext has no G15 hardware-workaround (BRN) code.
-- Timing, power and placement: serialization, delays to 100 ms, idle-off,
-  performance state, physical address and page colour of the list memory,
-  concurrent display and memory traffic.
-- History on Linux: a broad warm-up (214 jobs across every supported render
-  mode, compute, large targets, relinked long lists) and repeating the same
-  long list on the same pages (30 of 30 hang) do not lift it.
-- Content-level controls: padding experiments show some content past 0x40 is
-  consumed, so position alone is not the rule; the TPC tail value is not the
-  cause.
+A job that never finishes and that the firmware does not time out (an
+infinite-loop shader is the usual example) is caught by the kernel's
+watchdog (`g15_job_timeout_ms`, 5000 in the loader). The watchdog fails every
+pending job and refuses new submits, so nothing hangs, but **the GPU then
+needs a reboot** [HW]. Faults and the timeouts the firmware does report
+recover without one [HW].
 
-**What is left.** The remaining difference lies in state not visible from
-Linux: the GPU firmware's internal runtime state or hardware state that
-macOS establishes before the measured render [UNKNOWN]. Two next steps need
-macOS-side captures: a diff of firmware memory (Linux at the hang against
-macOS during the same render), and a replay of the exact macOS producer
-(all command, shader and state bytes) through the Linux driver to separate
-"input" from "hidden global state".
+macOS recovers from this case. Its captures show no host message before the
+firmware's timeout, but competing work on another 3D queue published shortly
+before it [NATIVE]. The best-supported reading is that the firmware's
+context-switch and kill limits (40 and 50 ms, which Linux sets to the same
+values) kill a context that does not yield to that work [STATIC]
+[INFERRED]. Admitting one competing compute job while a compute spin runs did
+not reproduce it: the firmware ran the competing job while the spin stayed
+live, and killed nothing [HW]. A fragment-side spin with competing 3D work, the shape macOS
+shows, is the next test [UNKNOWN].
 
-## 3. Other limits
+## 4. A short wait after each render
+
+One G15 job runs at a time device-wide, and the next render waits until about
+300 us after the previous one completed (`g15_reseed_min_age_us`) before it
+prepares its firmware event state. The firmware is still retiring the
+finished 3D job's event control for 26-187 us after the completion callback;
+seeding the channel's next event state inside that window hangs the next job
+(TA or Fragment two commands behind, no firmware timeout) [HW]. The wait
+sleeps for most of the interval and spins the last 50 us
+(`g15_retire_spin_us`). Without it, glmark2 scores about 15% higher on the
+same build, but back-to-back small renders hang [HW]. No firmware completion
+field that marks the end of that retirement in every workload has been found
+[UNKNOWN].
+
+## 5. Other limits
 
 | Limit | Status | Tag |
 |---|---|---|
-| Partial renders (TVB overflow mid-render) | Never triggered successfully; the list limit is hit first | [HW] |
 | MSAA, framebuffer compression | Not implemented | — |
-| Desktop GL version | GL 2.1 level plus extensions; apps needing GL 3.3 (e.g. Ghostty) run on the CPU renderer inside the G15 session | [HW] |
-| One GPU job at a time device-wide | Kept: overlapping two VMs' jobs crashes the firmware | [HW] |
-| Hangs the firmware does not report | Fail-stop cleanly via the kernel watchdog; the GPU then needs a reboot | [HW] |
+| Desktop GL version | GL 2.1 level plus extensions (GLES 3.0); apps needing GL 3.3 (e.g. Ghostty) run on the CPU renderer inside the G15 session | [HW] |
+| One GPU job at a time device-wide | Kept: overlapping two VMs' jobs crashed the firmware | [HW] |
+| GPU suspend | Not supported | — |

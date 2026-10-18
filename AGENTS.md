@@ -182,7 +182,7 @@ worked for them. Only then set GRUB's default to the `g15` entry.
 
 ## 9. Known limits
 
-See `docs/g15-spec/70-known-limits.md`. In short: mesh-heavy scenes are slow
-(small renders, ~0.7 ms per render), one GPU job runs at a time, desktop GL
-is 2.1 (GLES 3.0), no MSAA, no suspend support for the GPU, and an unreported
-GPU hang needs a reboot.
+See `docs/g15-spec/70-known-limits.md`. In short: one GPU job runs at a
+time with a short wait after each render, desktop GL is 2.1 (GLES 3.0), no
+MSAA, no suspend support for the GPU, and a GPU hang the firmware does not
+report (for example an infinite-loop shader) needs a reboot.
