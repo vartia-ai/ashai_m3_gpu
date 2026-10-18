@@ -7,7 +7,7 @@
 > firmware. It has been tested on one such laptop. A GPU hang the firmware does
 > not report (for example an app's infinite-loop shader) needs a reboot, GL is
 > at the 2.1 level (GLES 3.0), and there is no support. Do not use it on a
-> machine you cannot afford to reboot.
+> machine you cannot afford to reinstall the OS.
 
 A working GPU-accelerated Linux desktop on a MacBook Air M3 (J613, T8122,
 GPU G15G, firmware 14.7): Hyprland and GL/GLES clients rendered by the M3 GPU
