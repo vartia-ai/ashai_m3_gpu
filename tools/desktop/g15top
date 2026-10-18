@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""g15top: a live G15 GPU panel for a terminal next to btop.
+
+Reads the kernel's G15 accounting (debugfs asahi/g15_accounting, via sudo)
+and the SMC power sensors once a second. The driver does not publish per-
+client GPU time yet, so this shows job rates, not a busy percentage.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+ACCT = "/sys/kernel/debug/asahi/g15_accounting"
+HIST = 60
+SPARK = " ▁▂▃▄▅▆▇█"
+
+
+def accounting():
+    try:
+        out = subprocess.run(["sudo", "-n", "cat", ACCT], capture_output=True,
+                             text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    vals = {}
+    for tok in out.split():
+        k, sep, v = tok.partition("=")
+        if sep and k not in vals:
+            try:
+                vals[k] = int(v, 0)
+            except ValueError:
+                pass
+    return vals or None
+
+
+def smc_power():
+    for h in sorted(os.listdir("/sys/class/hwmon")):
+        d = os.path.join("/sys/class/hwmon", h)
+        try:
+            if open(os.path.join(d, "name")).read().strip() != "macsmc_hwmon":
+                continue
+        except OSError:
+            continue
+        p = {}
+        for f in os.listdir(d):
+            if f.startswith("power") and f.endswith("_label"):
+                b = f[:-len("_label")]
+                try:
+                    label = open(os.path.join(d, f)).read().strip()
+                    p[label] = int(open(os.path.join(d, b + "_input")).read()) / 1e6
+                except (OSError, ValueError):
+                    pass
+        return p
+    return {}
+
+
+def spark(vals, top):
+    top = max(top, 1)
+    return "".join(SPARK[min(len(SPARK) - 1, round(v / top * (len(SPARK) - 1)))]
+                   for v in vals)
+
+
+def bar(v, top, width):
+    n = min(width, round(v / max(top, 1) * width))
+    return "█" * n + "·" * (width - n)
+
+
+def main():
+    prev = accounting()
+    if prev is None:
+        sys.exit("g15top: cannot read %s (asahi G15 module loaded? sudo?)" % ACCT)
+    t_prev = time.monotonic()
+    jobs, parts = [0.0] * HIST, [0.0] * HIST
+    peak = 1.0
+    sys.stdout.write("\x1b[?25l\x1b[2J")
+    try:
+        while True:
+            time.sleep(1)
+            cur, t = accounting(), time.monotonic()
+            if cur is None:
+                continue
+            dt = t - t_prev
+            jr = (cur.get("completions", 0) - prev.get("completions", 0)) / dt
+            pr = (cur.get("partial_renders", 0) - prev.get("partial_renders", 0)) / dt
+            prev, t_prev = cur, t
+            jobs, parts = jobs[1:] + [jr], parts[1:] + [pr]
+            peak = max(peak * 0.98, max(jobs), 100.0)
+            # History graphs fill what the terminal has room for.
+            hw = max(10, min(HIST, shutil.get_terminal_size((80, 24)).columns - 20))
+            pw = smc_power()
+            sysw, socw = pw.get("Total System Power"), pw.get("Heatpipe Power")
+            ok = cur.get("crashed", 0) == 0 and cur.get("completion_errors", 0) == 0
+            lines = [
+                "\x1b[1m G15 GPU  (Apple M3, asahi G15 kernel driver + Mesa)\x1b[0m",
+                "",
+                " GPU jobs/s       %6.0f  %s" % (jr, bar(jr, peak, 28)),
+                "   last %2d s      " % hw + spark(jobs[-hw:], peak),
+                "",
+                " partial renders/s %5.0f" % pr,
+                "   last %2d s      " % hw + spark(parts[-hw:], max(max(parts), 1)),
+                "",
+                " jobs total  %10d   completed %10d" % (cur.get("submissions", 0),
+                                                      cur.get("completions", 0)),
+                " errors      %10d   recoveries %9d" % (cur.get("completion_errors", 0),
+                                                      cur.get("recoveries", 0)),
+                " firmware    %s" % ("\x1b[32mhealthy\x1b[0m" if ok else
+                                     "\x1b[31mcrashed\x1b[0m" if cur.get("crashed") else
+                                     "\x1b[33merrors seen\x1b[0m"),
+                "",
+                " power  system %5s W   SoC (heatpipe) %5s W" % (
+                    "%.1f" % sysw if sysw is not None else "-",
+                    "%.1f" % socw if socw is not None else "-"),
+            ]
+            sys.stdout.write("\x1b[H" + "".join(l + "\x1b[K\n" for l in lines) + "\x1b[J")
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\x1b[?25h\n")
+
+
+if __name__ == "__main__":
+    main()

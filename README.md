@@ -37,6 +37,10 @@ Mesh-heavy scenes are no longer slow: in the full offscreen glmark2 run at
 2560x1664 the Gouraud-shaded mesh renders at 479 fps (2 fps in the previous
 release) and the build scene at 537-548 fps.
 
+The [native aquarium demo](tools/demo/README.md), a desktop GL 2.1 port of the
+WebGL Aquarium, renders its 1440x1440 scene at 59, 38 and 18 fps with 1,000,
+5,000 and 10,000 fish on the G15, against 16, 10 and 7 fps on llvmpipe.
+
 Also: all 306 tests in our desktop-GL piglit list, a complete glmark2 run
 (score 443; its terrain scene's compute stage is refused, as
 expected), a one-hour Hyprland soak with 676,080 GPU jobs, and
@@ -87,6 +91,7 @@ the laptop).
 | [mesa/](mesa/README.md) | The Mesa G15 render patch, one diff against Gravity Mesa `87ac51d` |
 | [tools/gl-test/](tools/gl-test/README.md) | GLES test client with CPU-oracle and llvmpipe checks |
 | [tools/desktop/](tools/desktop/README.md) | Example scripts for running a Hyprland session on the G15 GPU |
+| [tools/demo/](tools/demo/README.md) | The WebGL Aquarium ported to a native OpenGL 2.1 program, run the same way on macOS and on the G15 driver |
 | [media/](media/) | Demo video, screenshot and numbers |
 
 **Built-in values.** Some tables in the kernel driver hold numbers observed
@@ -110,4 +115,7 @@ values observed in captures of macOS on the test laptop.
 ## License
 
 MIT (see [LICENSE](LICENSE)). The Mesa patch is a change to Mesa and is
-under Mesa's MIT license.
+under Mesa's MIT license. The native aquarium in
+[tools/demo/aquarium-native/](tools/demo/aquarium-native/) ports the WebGL
+Aquarium (Copyright 2009 Google Inc.) and is under its BSD 3-Clause license;
+see [its NOTICE](tools/demo/aquarium-native/NOTICE).

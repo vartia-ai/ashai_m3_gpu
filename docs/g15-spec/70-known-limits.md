@@ -91,6 +91,6 @@ field that marks the end of that retirement in every workload has been found
 | Limit | Status | Tag |
 |---|---|---|
 | MSAA, framebuffer compression | Not implemented | — |
-| Desktop GL version | GL 2.1 level plus extensions (GLES 3.0); apps needing GL 3.3 (e.g. Ghostty) run on the CPU renderer inside the G15 session | [HW] |
+| Desktop GL version | GL 2.1 level plus extensions (GLES 3.0); apps needing GL 3.x or 4.x (Ghostty 1.3 needs 4.3 core) run on the CPU renderer inside the G15 session. GL 3.0 needs 4x MSAA, GL 3.2 geometry shaders (compute-emulated in Asahi's Mesa, and G15 GL contexts cannot run compute jobs yet), GL 3.3 timer queries | [HW] |
 | One GPU job at a time device-wide | Kept: overlapping two VMs' jobs crashed the firmware | [HW] |
 | GPU suspend | Not supported | — |
