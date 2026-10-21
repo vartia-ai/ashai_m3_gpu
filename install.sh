@@ -106,7 +106,7 @@ check() {
         [ "$(free_mb /boot)" -ge 100 ] || no "the G15 kernel needs about 100 MB free in /boot"
         [ "$(free_mb /usr/lib/modules)" -ge 2500 ] || no "the G15 modules need about 2.5 GB free in /usr/lib/modules"
     fi
-    [ ! -d /var/lib/j613-display ] || ours \
+    [ ! -e /etc/systemd/system/j613-display.service ] || ours \
         || no "the external display is installed for another G15 kernel: update it with display/README.md"
 
     if [ -r /boot/grub/grub.cfg ]; then
@@ -148,7 +148,7 @@ install_all() {
         echo "the G15 kernel from this source is already installed"
     else
         [ "$(uname -r)" != "$release" ] || stop "the G15 kernel is running: boot the stock kernel to replace it"
-        [ ! -d /var/lib/j613-display ] \
+        [ ! -e /etc/systemd/system/j613-display.service ] \
             || stop "the external display is installed: follow display/README.md before replacing the kernel"
         make -s -C "$kwork/linux" O="$kwork/build" LOCALVERSION= modules_install
         mkdir -p /boot/g15 "$state"
