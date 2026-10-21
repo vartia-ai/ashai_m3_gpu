@@ -118,8 +118,9 @@ The same `PATH=...` prefix works in front of `kernel/build.sh`. The kernel
 then takes rustc and the Rust library source from that toolchain, and bindgen
 from the system. Mesa does not use Rust. With this toolchain, `olddefconfig`
 reports a config change. That is expected: only `CONFIG_RUSTC_VERSION_TEXT`
-differs, because it lacks Arch's "(Arch Linux rust ...)" suffix. If you are resuming a build that
-started with another rustc, use a new WORKDIR. Don't edit the source to fit
+differs, because it lacks Arch's "(Arch Linux rust ...)" suffix. If you are
+resuming a build that started with another rustc, use a new WORKDIR. Don't
+edit the source to fit
 another compiler. If the build fails with the tested release as well, report
 it. Alternatively, the person can keep the system compiler at the tested
 release with `IgnorePkg = rust rust-src` in `/etc/pacman.conf`.
