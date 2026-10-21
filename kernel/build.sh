@@ -5,7 +5,8 @@
 #   kernel/build.sh WORKDIR
 #
 # Produces WORKDIR/linux (source) and WORKDIR/build (objects, Image, modules).
-# Installs nothing; see AGENTS.md for installing and booting it.
+# Installs nothing; see AGENTS.md for installing and booting it. Rerunning
+# with the same WORKDIR resumes an interrupted build.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -21,33 +22,40 @@ display_tree=205560425730dd1aeb48bab8eb8bfd9bf8c7203f
 mkdir -p "$work"
 src=$work/linux
 obj=$work/build
-[ ! -e "$src" ] || { echo "$src exists: use a new WORKDIR"; exit 1; }
-git init -q "$src"
-git -C "$src" fetch --depth=1 "$upstream" "$base"
-git -C "$src" checkout -q FETCH_HEAD
-git -C "$src" -c user.name=g15-build -c user.email=g15-build@localhost \
-    am -q "$here"/base-patches/*.patch
-[ "$(git -C "$src" rev-parse HEAD^{tree})" = "$base_tree" ] \
-    || { echo "base tree mismatch"; exit 1; }
-git -C "$src" apply --index "$here/g15.patch"
-[ "$(git -C "$src" write-tree)" = "$g15_tree" ] \
-    || { echo "G15 tree mismatch"; exit 1; }
-git -C "$src" -c user.name=g15-build -c user.email=g15-build@localhost \
-    commit -q -m "G15 GPU driver (kernel/g15.patch)"
-# External display (display/README.md). Inert unless enabled: its overlay
-# module does nothing without stage=2.
-git -C "$src" apply --index "$here/../display/kernel.patch"
-[ "$(git -C "$src" write-tree)" = "$display_tree" ] \
-    || { echo "display tree mismatch"; exit 1; }
-git -C "$src" -c user.name=g15-build -c user.email=g15-build@localhost \
-    commit -q -m "J613 external display (display/kernel.patch)"
+if [ -e "$src" ]; then
+    # Resume: the source must be exactly the checked tree from an earlier run.
+    [ "$(git -C "$src" rev-parse HEAD^{tree} 2>/dev/null)" = "$display_tree" ] \
+        || { echo "$src exists and is not the tested source: use a new WORKDIR"; exit 1; }
+    echo "resuming the build in $work"
+else
+    git init -q "$src"
+    git -C "$src" fetch --depth=1 "$upstream" "$base"
+    git -C "$src" checkout -q FETCH_HEAD
+    git -C "$src" -c user.name=g15-build -c user.email=g15-build@localhost \
+        am -q "$here"/base-patches/*.patch
+    [ "$(git -C "$src" rev-parse HEAD^{tree})" = "$base_tree" ] \
+        || { echo "base tree mismatch"; exit 1; }
+    git -C "$src" apply --index "$here/g15.patch"
+    [ "$(git -C "$src" write-tree)" = "$g15_tree" ] \
+        || { echo "G15 tree mismatch"; exit 1; }
+    git -C "$src" -c user.name=g15-build -c user.email=g15-build@localhost \
+        commit -q -m "G15 GPU driver (kernel/g15.patch)"
+    # External display (display/README.md). Inert unless enabled: its overlay
+    # module does nothing without stage=2.
+    git -C "$src" apply --index "$here/../display/kernel.patch"
+    [ "$(git -C "$src" write-tree)" = "$display_tree" ] \
+        || { echo "display tree mismatch"; exit 1; }
+    git -C "$src" -c user.name=g15-build -c user.email=g15-build@localhost \
+        commit -q -m "J613 external display (display/kernel.patch)"
+fi
 # Host build tools only: linux-api-headers 7.3 and later use __u128 in the arm64
 # uapi headers, which this tree's tools/include does not define. Applied after
 # the tree checks; the kernel and modules are unchanged.
-git -C "$src" apply "$here/host-tools-u128.patch"
+git -C "$src" apply --reverse --check "$here/host-tools-u128.patch" 2>/dev/null \
+    || git -C "$src" apply "$here/host-tools-u128.patch"
 
 mkdir -p "$obj"
-cp "$here/config" "$obj/.config"
+cmp -s "$here/config" "$obj/.config" || cp "$here/config" "$obj/.config"
 make -C "$src" O="$obj" LOCALVERSION= olddefconfig
 cmp -s "$here/config" "$obj/.config" \
     || echo "note: olddefconfig changed the config (different compiler or rustc version?)"
