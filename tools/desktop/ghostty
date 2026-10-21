@@ -1,5 +1,17 @@
 #!/bin/sh
 # m3gpu: ghostty needs desktop OpenGL 4.3 core, which the G15 driver does not
-# provide yet; in the G15 session run it on the CPU renderer (sw).
-if [ -n "${ASAHI_G15_GRAPHICS:-}" ]; then exec /usr/local/bin/sw /usr/bin/ghostty "$@"; fi
+# provide yet; in the G15 session run it on the CPU renderer (system Mesa,
+# llvmpipe). The shells it starts get the session's G15 settings back through
+# Ghostty's env option, so GPU apps started from a terminal still use the GPU.
+# (Ghostty's env can set but not unset a variable, so Ghostty itself gets only
+# LIBGL_ALWAYS_SOFTWARE, which its shells override with 0.)
+if [ -n "${ASAHI_G15_GRAPHICS:-}" ]; then
+    set -- --env=LIBGL_ALWAYS_SOFTWARE=0 --env=ASAHI_G15_GRAPHICS="$ASAHI_G15_GRAPHICS" "$@"
+    for v in LD_LIBRARY_PATH GBM_BACKENDS_PATH __EGL_VENDOR_LIBRARY_FILENAMES; do
+        eval "val=\${$v:-}"
+        [ -z "$val" ] || set -- "--env=$v=$val" "$@"
+    done
+    exec env -u LD_LIBRARY_PATH -u GBM_BACKENDS_PATH -u __EGL_VENDOR_LIBRARY_FILENAMES \
+        -u ASAHI_G15_GRAPHICS LIBGL_ALWAYS_SOFTWARE=1 /usr/bin/ghostty "$@"
+fi
 exec /usr/bin/ghostty "$@"
