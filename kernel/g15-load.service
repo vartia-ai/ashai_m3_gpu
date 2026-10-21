@@ -1,0 +1,19 @@
+# Install as /etc/systemd/system/g15-load.service, then: systemctl enable g15-load.service
+# Loads the G15 GPU driver once at boot, before the login screen, so the desktop
+# session can use the GPU from the first boot. Does nothing on other kernels.
+[Unit]
+Description=Load the G15 GPU driver (m3_gpu)
+ConditionKernelVersion=*-display-driver-g15
+# g15-load reads the driver's accounting in debugfs. Load after the external
+# display setup (if installed), as in the tested order.
+After=local-fs.target sys-kernel-debug.mount systemd-udev-trigger.service j613-display.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/g15-load
+RemainAfterExit=yes
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

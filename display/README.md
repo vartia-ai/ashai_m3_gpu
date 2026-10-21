@@ -59,6 +59,19 @@ m1n1 includes other required platform changes, preserve and review those
 changes too. No assembled m1n1 image, firmware, ADT or device tree is
 distributed here. See [the m1n1 attribution](NOTICE.md).
 
+On Arch Linux ARM the `rust` package has only the host target, so a plain
+`make` fails at `build/librust.a`. Do not install the `rustup` package: it
+replaces `rust`, which the kernel build uses. Install rustup for your user
+only, without changing your PATH, and add the target:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --no-modify-path --profile minimal
+~/.cargo/bin/rustup target add aarch64-unknown-none-softfloat
+```
+
+Then put `~/.cargo/bin` first on the PATH for the m1n1 build only, as below.
+
 ```sh
 release_dir=$PWD
 git init m1n1-display
@@ -67,13 +80,13 @@ git -C m1n1-display fetch --depth=1 https://github.com/AsahiLinux/m1n1.git \
 git -C m1n1-display checkout --detach FETCH_HEAD
 git -C m1n1-display apply --index "$release_dir/display/m1n1.patch"
 git -C m1n1-display write-tree
-make -C m1n1-display -j"$(nproc)"
+PATH=$HOME/.cargo/bin:$PATH make -C m1n1-display -j"$(nproc)"
 ```
 
 With only the released patch applied, the source tree hash is
-`2b294caa5b0b6c164ff052762562b3f1d9fbc4f5`. This source builds both m1n1.bin and m1n1.macho. A local
-build with additional required changes has a different tree hash and needs
-its own review.
+`2b294caa5b0b6c164ff052762562b3f1d9fbc4f5`. This source builds both
+m1n1.bin and m1n1.macho. A local build with additional required changes has
+a different tree hash and needs its own review.
 
 Locate the standalone m1n1 binary used to assemble your current
 `/boot/m1n1/boot.bin`. A distribution may keep it at
@@ -102,9 +115,31 @@ sudo python3 display/boot-image.py install --candidate boot.bin.display \
 
 Installation first creates `/boot/m1n1/boot.bin.before-j613-display`, then
 copies, syncs and atomically renames the candidate to `boot.bin`. It refuses
-to replace a newer active image or an unrelated backup. It does not reboot
-or change the boot selection. Reboot into the existing stock kernel first,
-then verify the live reservations:
+to replace a newer active image or an unrelated backup. A
+`boot.bin.before-j613-display` left by an earlier install counts as
+unrelated: rename it (for example with a date suffix) rather than deleting
+it. It does not reboot or change the boot selection.
+
+**Keep it across updates.** Package updates that touch m1n1 or the kernel's
+device trees run `update-m1n1`, which rebuilds `boot.bin` from
+`/etc/default/update-m1n1` and would put the previous m1n1 back. Install the
+new m1n1 to a system path and point `M1N1=` at it, keeping the `DTBS=`
+setting your image was built with:
+
+```sh
+sudo install -D -m 644 m1n1-display/build/m1n1.bin /usr/local/lib/j613-display/m1n1.bin
+sudoedit /etc/default/update-m1n1   # set M1N1=/usr/local/lib/j613-display/m1n1.bin
+```
+
+If the file does not exist yet, create it with only the `M1N1=` line:
+`update-m1n1` then keeps its default device trees (those of the newest stock
+kernel), which are the ones a stock image carries. With the right settings,
+`sudo env LC_ALL=C update-m1n1` reproduces the candidate image exactly
+(compare `sha256sum /boot/m1n1/boot.bin` with the candidate hash).
+The glob order of `DTBS=` depends on the locale, and the package hook runs
+with the C locale, so use `LC_ALL=C` when you run it by hand.
+
+Reboot (into either kernel), then verify the live reservations:
 
 ```sh
 sudo python3 display/check-reservations.py

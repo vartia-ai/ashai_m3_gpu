@@ -2,8 +2,8 @@
 
 > [!WARNING]
 > **Early research release, one machine only.** It installs and runs on a
-> MacBook Air 13" M3 (J613) whose Linux install uses the macOS 14.7 stub
-> firmware, and nowhere else: the driver refuses to start on other models or
+> MacBook Air 13" M3 (J613) whose Linux install uses the Asahi installer's
+> macOS 14.8.3 stub (firmware 14.7), and nowhere else: the driver refuses to start on other models or
 > firmware. It has been tested on one such laptop. A GPU hang the firmware does
 > not report (for example an app's infinite-loop shader) needs a reboot, GL is
 > at the 2.1 level (GLES 3.0), and there is no support. Do not use it on a
@@ -73,7 +73,9 @@ Only if all of these hold (details and the commands to check them:
 - it **already runs Linux** through an Asahi-style install (m1n1, U-Boot,
   GRUB);
 - the Linux install's **stub macOS firmware is 14.7**
-  (`/proc/device-tree/chosen/asahi,os-fw-version` reads `14.7`).
+  (`/proc/device-tree/chosen/asahi,os-fw-version` reads `14.7`). The Asahi
+  installer gives every M3 a macOS 14.8.3 stub, which reports 14.7, so a
+  current install qualifies. The macOS you use day to day does not matter.
 
 Other M3 machines, other M-series chips and other firmware versions are not
 supported yet. The driver needs a set of machine- and firmware-specific values
@@ -84,24 +86,26 @@ for this configuration; see [kernel/README.md](kernel/README.md).
 
 Clone this repository on the laptop and have a coding agent (Claude Code,
 Codex or similar) follow [AGENTS.md](AGENTS.md); it is also readable as a
-manual guide. It checks the machine, builds the kernel and Mesa from source,
-adds the kernel as a **one-time, non-default** boot entry next to your
-existing one, loads the driver and runs a rendering test. Your existing boot
-entry, m1n1, macOS and disk encryption are left alone, and undoing it is
-removing a few files. Building takes a while (a full kernel plus Mesa, on
-the laptop).
+manual guide. It checks the machine, builds the kernel and Mesa from source
+on the laptop, adds the kernel as a **one-time, non-default** boot entry
+next to your existing one, and sets up the desktop session, so the first
+boot of the new kernel already runs Omarchy (Hyprland) on the GPU. It then
+runs a rendering test. Your existing boot entry, m1n1, macOS and disk
+encryption are left alone (the optional external display is the one feature
+that changes m1n1), and undoing it is removing a few files. Building takes a
+while (a full kernel plus Mesa, on the laptop).
 
 ## What is here
 
 | Path | Contents |
 |---|---|
 | [AGENTS.md](AGENTS.md) | Install guide, written for a coding agent |
-| [kernel/](kernel/README.md) | The kernel: base patches, the G15 driver patch, config, build script, driver loader |
+| [kernel/](kernel/README.md) | The kernel: base patches, the G15 driver patch, config, build script, driver loader and its boot unit |
 | [display/](display/README.md) | Optional external display on the front USB-C port: kernel patch (applied by the default build, inactive until enabled), m1n1 reservation patch, installer and rollback |
 | [docs/g15-spec/](docs/g15-spec/README.md) | How the G15 GPU is driven: memory map, firmware interface and submission, render and compute jobs, shaders, display, known limits. Written for developers who know the M1/M2 (G13/G14) Asahi driver |
 | [mesa/](mesa/README.md) | The Mesa G15 render patch, one diff against Gravity Mesa `87ac51d` |
 | [tools/gl-test/](tools/gl-test/README.md) | GLES test client with CPU-oracle and llvmpipe checks |
-| [tools/desktop/](tools/desktop/README.md) | Example scripts for running a Hyprland session on the G15 GPU |
+| [tools/desktop/](tools/desktop/README.md) | Installer and helpers that run the Hyprland session on the G15 GPU from the first boot |
 | [tools/demo/](tools/demo/README.md) | The WebGL Aquarium ported to a native OpenGL 2.1 program, run the same way on macOS and on the G15 driver |
 | [media/](media/) | Demo video, screenshot and numbers |
 

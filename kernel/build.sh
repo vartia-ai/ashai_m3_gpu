@@ -41,6 +41,10 @@ git -C "$src" apply --index "$here/../display/kernel.patch"
     || { echo "display tree mismatch"; exit 1; }
 git -C "$src" -c user.name=g15-build -c user.email=g15-build@localhost \
     commit -q -m "J613 external display (display/kernel.patch)"
+# Host build tools only: linux-api-headers 7.3 and later use __u128 in the arm64
+# uapi headers, which this tree's tools/include does not define. Applied after
+# the tree checks; the kernel and modules are unchanged.
+git -C "$src" apply "$here/host-tools-u128.patch"
 
 mkdir -p "$obj"
 cp "$here/config" "$obj/.config"

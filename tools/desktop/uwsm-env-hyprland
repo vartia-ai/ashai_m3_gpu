@@ -1,21 +1,33 @@
-# M3 GPU (G15, m3gpu project): on the G15 kernel (release *-display-driver-g15), load the
-# G15 GPU driver and run this Hyprland session on the G15 Mesa. On any other
-# kernel, or on a test-harness boot, this file does nothing. To disable:
-# delete this file.
+# M3 GPU (G15, m3gpu project): on the G15 kernel (release *-display-driver-g15), run
+# this Hyprland session on the G15 Mesa. g15-load.service loads the driver at boot,
+# before the login screen. On any other kernel, or on a test-harness boot, this
+# file does nothing. To disable: delete this file.
 # A test-harness boot (tools/j613-live.sh leaves this marker before it
 # reboots and removes it when done) loads its own driver: leave it alone.
 case "$(uname -r)" in *-display-driver-g15) g15_kernel=1 ;; *) g15_kernel= ;; esac
 if [ -n "$g15_kernel" ] && [ ! -e "$HOME/.cache/m3gpu-harness-boot" ]; then
-    sudo -n /usr/local/sbin/g15-load >/tmp/g15-load.log 2>&1
-    if grep -q '^asahi ' /proc/modules; then
-        G15_MESA=${G15_MESA:-$HOME/g15-mesa}
+    # Without g15-load.service, fall back to loading it here (needs a sudoers rule).
+    grep -q '^asahi ' /proc/modules || sudo -n /usr/local/sbin/g15-load >/tmp/g15-load.log 2>&1
+    G15_MESA=${G15_MESA:-$HOME/g15-mesa}
+    if grep -q '^asahi ' /proc/modules && [ -e "$G15_MESA/50_g15_mesa.json" ]; then
         export LD_LIBRARY_PATH="$G15_MESA/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         export GBM_BACKENDS_PATH="$G15_MESA/lib/gbm"
         export __EGL_VENDOR_LIBRARY_FILENAMES="$G15_MESA/50_g15_mesa.json"
         export ASAHI_G15_GRAPHICS=1
-        export AQ_DRM_DEVICES=/dev/dri/card1
+        # GTK4: no Vulkan on G15 and its GL renderer draws blank windows; use cairo.
+        export GSK_RENDERER=cairo
+        # Scan out on every display controller (internal panel and, when enabled, the
+        # external DCP). Card numbers change with the GPU and external display.
+        AQ_DRM_DEVICES=
+        for _g15_card in /sys/class/drm/card[0-9]*; do
+            case "$_g15_card" in *-*) continue ;; esac
+            [ "$(basename "$(readlink -f "$_g15_card/device/driver")")" = apple-drm ] || continue
+            AQ_DRM_DEVICES="${AQ_DRM_DEVICES:+$AQ_DRM_DEVICES:}/dev/dri/${_g15_card##*/}"
+        done
+        export AQ_DRM_DEVICES="${AQ_DRM_DEVICES:-/dev/dri/card1}"
+        unset _g15_card
     else
-        # Driver not loaded: keep the session on the CPU renderer.
+        # Driver not loaded or Mesa not built: keep the session on the CPU renderer.
         export MESA_LOADER_DRIVER_OVERRIDE=kms_swrast LIBGL_ALWAYS_SOFTWARE=1
     fi
 fi
