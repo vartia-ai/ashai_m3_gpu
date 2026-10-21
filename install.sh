@@ -90,7 +90,7 @@ check() {
         || note "missing build packages:" $v "(sudo $0 packages)"
     v=$(rustc --version 2>/dev/null | cut -d' ' -f2 || true)
     [ -z "$v" ] || [ "$v" = 1.98.1 ] \
-        || note "rustc $v, tested 1.98.1: if the kernel build fails in Rust code, report it (AGENTS.md section 3)"
+        || note "rustc $v, tested 1.98.1: build with the tested release from rustup (AGENTS.md section 3, Rust version)"
     grep -Eqs '^[[:space:]]*IgnorePkg[[:space:]]*=.*[[:space:]]rust([[:space:]]|$)' /etc/pacman.conf \
         || note "to keep rust at a working release across updates: IgnorePkg = rust rust-src in /etc/pacman.conf"
 
