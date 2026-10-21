@@ -5,6 +5,39 @@ under Linux, using this repository. Read this whole file before doing
 anything. Work step by step, show the person each command before you run
 anything that needs root, and stop at the first failed check.
 
+## The short way: install.sh
+
+On the Asahi Arch Linux ARM setup (pacman, mkinitcpio, GRUB with
+`custom.cfg`, as under Omarchy), `install.sh` does sections 1 and 3 to 6.
+Use it unless one of its checks sends you to the manual steps. Every step
+can be rerun.
+
+1. `~/g15/install.sh check` changes nothing. Show the person its output and
+   stop at any `STOP` line, explaining it (sections 1, 5 and 8).
+2. If it lists missing build packages, the person runs
+   `sudo ~/g15/install.sh packages`.
+3. `~/g15/install.sh build`, as the person, not root: builds the kernel and
+   Mesa at low priority (about an hour; run it in the background). It
+   resumes an interrupted build.
+4. `sudo ~/g15/install.sh install` is the one step that changes the system.
+   Before it runs, tell the person what it does. It installs:
+   - the kernel to `/boot/g15` and `/lib/modules/7.2.2-display-driver-g15`,
+     together with the driver loader;
+   - a GRUB entry with `--id g15`, written to `/boot/grub/custom.cfg` and
+     copied from the entry they booted with (`sudo ~/g15/install.sh check`
+     previews it with secrets redacted);
+   - the desktop session (section 6).
+
+   It keeps the existing entries, the GRUB default, m1n1 and the stock
+   kernel, and keeps a copy of any file it replaces.
+5. Section 7: `sudo grub-reboot g15 && sudo reboot`, then check.
+
+The root steps need the person's approval. If your shell cannot ask for a
+password, the person types them (in Claude Code: `! sudo ...`). Someone at a
+terminal can run steps 1 to 4 in one go, entering the password once:
+`sudo ~/g15/install.sh all`. The external display stays a separate step,
+taken only when the person asks for it ([display/README.md](display/README.md)).
+
 ## 1. Check that this machine can use it
 
 This release works on exactly one configuration. All of these must hold;
@@ -217,7 +250,9 @@ the GRUB entry, `/boot/g15`, `/lib/modules/7.2.2-display-driver-g15`,
 the section 6 pieces: `sudo systemctl disable g15-load.service`, then remove
 `/etc/systemd/system/g15-load.service`, `~/.config/uwsm/env-hyprland` and the
 wrappers listed in `tools/desktop/README.md` (restoring any `.bak-<date>`
-copies). The external display has its own rollback in `display/README.md`.
+copies). After `install.sh`, also remove `/var/lib/g15-install`; the
+`g15` entry is in `/boot/grub/custom.cfg`, with the previous file kept as
+`custom.cfg.bak-<date>`. The external display has its own rollback in `display/README.md`.
 
 **Making it the default** is the person's decision, once the G15 kernel has
 worked for them. Only then set GRUB's default to the `g15` entry.

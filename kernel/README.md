@@ -13,6 +13,7 @@ the M3 GPU (G15G), plus the display (DCP) support it runs with.
 | `g15-load` | Load the GPU driver after boot, with the tested options |
 | `g15-load.service` | Runs `g15-load` at boot, before the login screen, on the G15 kernel only, so the desktop can use the GPU from the first boot |
 | `modprobe-g15.conf` | Stops udev from autoloading the driver without those options |
+| `grub-entry.py` | Adds the `--id g15` GRUB entry to `custom.cfg`, copied from the entry Linux booted with (only the title, id and the two paths change), and prints it with secrets redacted. Used by `../install.sh`; tests: `python3 -B -m unittest discover -s kernel -p 'test_*.py'` |
 
 ## When it works
 

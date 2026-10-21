@@ -17,8 +17,9 @@ as one diff against Gravity Mesa commit `87ac51d411f0e58a9433567ec2666f457be89e1
 The public patch omits one private diagnostic (loading macOS-compiled
 fragment shaders from local files); otherwise it equals the development branch.
 
-Apply with `git apply g15-render.patch` on that commit (build steps:
-[../AGENTS.md](../AGENTS.md), section 6). The driver talks to the G15 kernel
+Apply with `git apply g15-render.patch` on that commit, or fetch, patch and
+build it with `build.sh SRCDIR PREFIX` (steps: [../AGENTS.md](../AGENTS.md),
+section 4). The driver talks to the G15 kernel
 driver's UAPI (`DRM_ASAHI_*` G15 extensions) in [../kernel](../kernel/README.md).
 
 Set `ASAHI_G15_GRAPHICS=1` to enable G15 rendering.

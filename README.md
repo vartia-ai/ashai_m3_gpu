@@ -95,15 +95,21 @@ encryption are left alone (the optional external display is the one feature
 that changes m1n1), and undoing it is removing a few files. Building takes a
 while (a full kernel plus Mesa, on the laptop).
 
+On the Asahi Arch Linux ARM setup (as under Omarchy), [install.sh](install.sh)
+does all of it except the reboot: `./install.sh check`, then
+`./install.sh build`, then `sudo ./install.sh install`, then one reboot into
+the new entry. Or run `sudo ./install.sh all` once and reboot.
+
 ## What is here
 
 | Path | Contents |
 |---|---|
 | [AGENTS.md](AGENTS.md) | Install guide, written for a coding agent |
-| [kernel/](kernel/README.md) | The kernel: base patches, the G15 driver patch, config, build script, driver loader and its boot unit |
+| [install.sh](install.sh) | Checks, builds and installs everything in AGENTS.md on Asahi Arch Linux ARM |
+| [kernel/](kernel/README.md) | The kernel: base patches, the G15 driver patch, config, build script, driver loader, its boot unit and the GRUB entry helper |
 | [display/](display/README.md) | Optional external display on the front USB-C port: kernel patch (applied by the default build, inactive until enabled), m1n1 reservation patch, installer and rollback |
 | [docs/g15-spec/](docs/g15-spec/README.md) | How the G15 GPU is driven: memory map, firmware interface and submission, render and compute jobs, shaders, display, known limits. Written for developers who know the M1/M2 (G13/G14) Asahi driver |
-| [mesa/](mesa/README.md) | The Mesa G15 render patch, one diff against Gravity Mesa `87ac51d` |
+| [mesa/](mesa/README.md) | The Mesa G15 render patch, one diff against Gravity Mesa `87ac51d`, and its build script |
 | [tools/gl-test/](tools/gl-test/README.md) | GLES test client with CPU-oracle and llvmpipe checks |
 | [tools/desktop/](tools/desktop/README.md) | Installer and helpers that run the Hyprland session on the G15 GPU from the first boot |
 | [tools/demo/](tools/demo/README.md) | The WebGL Aquarium ported to a native OpenGL 2.1 program, run the same way on macOS and on the G15 driver |

@@ -6,8 +6,9 @@ from [../../kernel](../../kernel/README.md), its loader installed as
 `/usr/local/sbin/g15-load`, and a G15 Mesa build installed under `$G15_MESA`
 (default `~/g15-mesa`), as in [../../AGENTS.md](../../AGENTS.md).
 
-Install everything below with one command, as the desktop user (it uses sudo
-for the system files and keeps a `.bak-<date>` copy of any file it replaces):
+Install everything below with one command, as the desktop user or with sudo
+from it (it uses sudo for the system files and keeps a `.bak-<date>` copy of
+any file it replaces; `../../install.sh install` runs it for you):
 
 ```
 tools/desktop/install.sh
