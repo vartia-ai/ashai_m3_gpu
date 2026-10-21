@@ -32,7 +32,10 @@ a mismatch cannot damage anything; it just will not work.
   the person's working one, and do not make the new entry the default. Do not
   touch m1n1, U-Boot, the EFI partition layout, macOS, the stub firmware, or
   disk encryption settings. If anything in the steps below would need that,
-  stop and ask.
+  stop and ask. The one exception is the optional external display
+  ([display/README.md](display/README.md)): it needs an m1n1 change, made
+  only when the person explicitly asks for that feature, following that
+  guide, with their current boot image kept beside the new one.
 - **Never print secrets.** Kernel command lines can hold disk-unlock material
   (for example `cryptkey=`). Redact such values whenever you show GRUB
   entries, `/proc/cmdline` or logs.
@@ -48,7 +51,7 @@ a mismatch cannot damage anything; it just will not work.
 ## 3. Build the kernel
 
 ```
-git clone https://github.com/vartia-ai/ashai_m3_gpu.git ~/g15
+git clone https://github.com/vartia-ai/m3_gpu.git ~/g15
 ~/g15/kernel/build.sh ~/g15-kernel
 ```
 

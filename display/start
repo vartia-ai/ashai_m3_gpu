@@ -1,0 +1,55 @@
+#!/bin/bash
+# Enable the runtime display route before loading the USB-C PD controller.
+set -euo pipefail
+release=$(cat /var/lib/j613-display/kernel-release)
+[[ $(uname -r) == "$release" ]] || exit 1
+[[ ${1:-} != --check-kernel ]] || exit 0
+finish() {
+    local rc=$?
+    trap - EXIT
+    if ! modprobe sn201202x; then
+        echo 'The USB-C port controller could not be loaded.'
+        [[ $rc != 0 ]] || rc=1
+    fi
+    if [[ -n ${log:-} ]]; then
+        journalctl -b -k --no-pager |
+            sed -E 's/cryptkey=[^[:space:]]+/cryptkey=[REDACTED]/g' > "${log%.log}-kernel.log" || true
+    fi
+    echo "Display startup exit=$rc"
+    exit "$rc"
+}
+trap finish EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+mkdir -p /var/log/j613-display
+log=/var/log/j613-display/$(cat /proc/sys/kernel/random/boot_id).log
+exec > >(tee -a "$log") 2>&1
+/usr/local/libexec/j613-display-check-reservations
+modprobe appledrm
+if [[ -d /sys/module/j613_dispext_overlay ]]; then
+    stage=$(cat /sys/module/j613_dispext_overlay/parameters/stage)
+    port=$(cat /sys/module/j613_dispext_overlay/parameters/port)
+    if [[ $stage == 0 ]]; then
+        rmmod j613_dispext_overlay
+    elif [[ $stage != 2 || $port != 1 ]]; then
+        echo 'An incompatible overlay is already active; reboot before changing it.'
+        exit 1
+    fi
+fi
+if [[ ! -d /sys/module/j613_dispext_overlay ]]; then
+    modprobe j613_dispext_overlay stage=0 port=1
+    rmmod j613_dispext_overlay
+    modprobe mux_apple_display_crossbar
+    modprobe j613_dispext_overlay stage=2 port=1 xbar_state=2
+fi
+modprobe sn201202x
+udevadm settle --timeout=15 || true
+for attempt in {1..15}; do
+    [[ ! -L /sys/bus/platform/devices/31ac00000.dcp/driver ]] || break
+    sleep 1
+done
+if [[ ! -L /sys/bus/platform/devices/31ac00000.dcp/driver ]]; then
+    echo 'The external display controller did not bind.'
+    exit 1
+fi
+echo 'External display controller ready. A monitor may be connected now or later.'

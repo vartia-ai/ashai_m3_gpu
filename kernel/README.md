@@ -7,8 +7,8 @@ the M3 GPU (G15G), plus the display (DCP) support it runs with.
 |---|---|
 | `base-patches/` | 8 patches on top of AsahiLinux/linux `asahi-wip-7.2` @ `236788cd2602`: DCP display device-tree nodes for t8122/t603x (AsahiLinux PR 608) and the DCP 14.7 tiling fix (PR 607). Authorship as in the PRs |
 | `g15.patch` | Everything else, one diff: the G15 GPU driver (`drivers/gpu/drm/asahi`), its UAPI, the Rust kernel-crate support it needs, the DCP soft power-off for 14.7 firmware, and two small fixes (`of_reserved_mem.c`, `soc/apple`) |
-| `config` | The tested kernel config (release suffix `-display-driver-g15`) |
-| `build.sh` | Fetch, patch, check the source tree hashes and build `Image` + modules |
+| `config` | The tested kernel config (release suffix `-display-driver-g15`), including the USB-C PD controller driver the external display needs |
+| `build.sh` | Fetch, patch, check the source tree hashes and build `Image` + modules. It also applies [`../display/kernel.patch`](../display/README.md) (external display; inactive until its service is enabled) |
 | `g15-load` | Load the GPU driver after boot, with the tested options |
 | `modprobe-g15.conf` | Stops udev from autoloading the driver without those options |
 

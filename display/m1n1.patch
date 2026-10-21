@@ -1,0 +1,124 @@
+diff --git a/src/kboot.c b/src/kboot.c
+index 3e3c734..78e5fd1 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -1846,7 +1846,7 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
+         int mem_node =
+             dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg->phys, seg_size);
+         if (mem_node < 0)
+-            return ret;
++            return mem_node;
+         uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
+ 
+         ret = dt_device_set_reserved_mem(mem_node, node_name, dev_phandle, iova, seg_size);
+@@ -1863,6 +1863,65 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
+     return 0;
+ }
+ 
++/*
++ * J613: reserve the external DCP's live firmware segments before Linux can
++ * allocate them. dcpext and its DARTs stay disabled; j613_dispext_overlay
++ * supplies their wiring and explicitly controls power-up.
++ */
++static int dt_reserve_j613_dcpext_firmware(void)
++{
++    const char *path = "/soc/dcp@31ac00000";
++    const char *adt_path = "/arm-io/dcpext/iop-dcpext-nub";
++    const struct adt_segment_ranges *seg;
++    u32 len = 0;
++    int ret, node;
++
++    if (fdt_node_check_compatible(dt, 0, "apple,j613"))
++        return 0;
++
++    node = fdt_path_offset(dt, path);
++    if (node < 0 || fdt_node_check_compatible(dt, node, "apple,t8122-dcpext"))
++        bail("FDT: J613 dcpext node missing or incompatible\n");
++
++    const char *status = fdt_getprop(dt, node, "status", &ret);
++    if (!status || ret != sizeof("disabled") || memcmp(status, "disabled", ret))
++        bail("FDT: J613 dcpext is not disabled; skipping local reservation\n");
++    if (fdt_getprop(dt, node, "memory-region", NULL))
++        bail("FDT: J613 dcpext already has memory-region; skipping local reservation\n");
++
++    node = adt_path_offset(adt, adt_path);
++    if (node < 0)
++        bail("ADT: J613 dcpext firmware not found\n");
++    seg = adt_getprop(adt, node, "segment-ranges", &len);
++    if (!seg || !len || len % sizeof(*seg) || len / sizeof(*seg) > 16)
++        bail("ADT: invalid J613 dcpext segment-ranges\n");
++
++    /* Validate every segment before modifying the FDT. */
++    for (unsigned i = 0; i < len / sizeof(*seg); i++) {
++        u64 size = ALIGN_UP((u64)seg[i].size, SZ_16K);
++
++        if (!seg[i].phys || !seg[i].remap || !size ||
++            (seg[i].phys & (SZ_16K - 1)) || (seg[i].remap & (SZ_16K - 1)) ||
++            seg[i].phys + size < seg[i].phys || seg[i].remap + size < seg[i].remap)
++            bail("ADT: invalid J613 dcpext segment %u\n", i);
++    }
++
++    ret = dt_reserve_asc_firmware(adt_path, NULL, path, true, 0);
++    if (ret)
++        return ret;
++
++    node = fdt_path_offset(dt, path);
++    if (node < 0)
++        return node;
++    ret = fdt_setprop_u32(dt, node, "m3gpu,firmware-reservation-version", 1);
++    if (ret)
++        return ret;
++
++    printf("FDT: J613 dcpext reserved %zu live firmware segments; controller stays disabled\n",
++           len / sizeof(*seg));
++    return 0;
++}
++
+ static const char dcpext_aliases[][8] = {
+     "dcpext",  "dcpext0", "dcpext1", "dcpext2", "dcpext3",
+     "dcpext4", "dcpext5", "dcpext6", "dcpext7",
+@@ -1925,6 +1984,15 @@ static struct disp_mapping disp_reserved_regions_t8112[] = {
+     {"region-id-95", "region95", true, false, true},
+ };
+ 
++/* M3 (t8122): ADT carveouts 49/50/57/94/95 exist, there is no region-id-157 */
++static struct disp_mapping disp_reserved_regions_t8122[] = {
++    {"region-id-49", "asc-firmware", true, false, false},
++    {"region-id-50", "dcp_data", true, false, false},
++    {"region-id-57", "region57", true, false, false},
++    {"region-id-94", "region94", true, true, false},
++    {"region-id-95", "region95", true, false, true},
++};
++
+ static struct disp_mapping disp_reserved_regions_t600x[] = {
+     {"region-id-50", "dcp_data", true, false, false},
+     {"region-id-57", "region57", true, false, false},
+@@ -2047,6 +2115,28 @@ static int dt_set_display(void)
+             return ret;
+     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6022")) {
+         /* noop */
++    } else if (!fdt_node_check_compatible(dt, 0, "apple,t8122")) {
++        /* t8122: never fail the boot over display setup */
++        if (!fdt_get_alias(dt, "dcp")) {
++            printf("FDT: t8122 DT without dcp alias, skip display reserved-memory setup\n");
++            return 0;
++        }
++        ret = dt_carveout_reserved_regions("dcp", "disp0", disp0_piodma_alias,
++                                           disp_reserved_regions_t8122,
++                                           ARRAY_SIZE(disp_reserved_regions_t8122));
++        if (!ret)
++            ret = dt_vram_reserved_region("dcp", "disp0");
++        if (ret) {
++            printf("FDT: t8122 display setup failed (%d), disabling dcp\n", ret);
++            int dcp_node = fdt_path_offset(dt, "dcp");
++            if (dcp_node >= 0)
++                fdt_setprop_string(dt, dcp_node, "status", "disabled");
++        }
++        ret = dt_reserve_j613_dcpext_firmware();
++        if (ret)
++            printf("FDT: J613 dcpext reservation failed (%d); external display stays disabled\n",
++                   ret);
++        return 0;
+     } else {
+         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
+         return 0;

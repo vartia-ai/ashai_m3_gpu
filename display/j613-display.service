@@ -1,0 +1,15 @@
+[Unit]
+Description=J613 front USB-C DisplayPort
+After=local-fs.target systemd-udev-trigger.service
+Before=display-manager.service
+ConditionPathExists=/var/lib/j613-display/kernel-release
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/local/libexec/j613-display-start --check-kernel
+ExecStart=/usr/local/libexec/j613-display-start
+TimeoutStartSec=90
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

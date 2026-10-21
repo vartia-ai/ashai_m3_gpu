@@ -13,6 +13,11 @@ A working GPU-accelerated Linux desktop on a MacBook Air M3 (J613, T8122,
 GPU G15G, firmware 14.7): Hyprland and GL/GLES clients rendered by the M3 GPU
 through Mesa, using a G15 port of the Asahi AGX kernel driver.
 
+![The WebGL Aquarium, 10,000 fish, rendered by the M3 GPU](media/g15-aquarium-10000-fish.jpg)
+
+*The [native aquarium demo](tools/demo/README.md) with 10,000 fish at 31 fps on
+the M3 GPU (OpenGL 2.1, Mesa).*
+
 ![Hyprland on the M3 GPU](media/g15-hyprland-demo.png)
 
 Video: [media/g15-hyprland-demo.mp4](media/g15-hyprland-demo.mp4) (36 s,
@@ -46,6 +51,11 @@ Also: all 306 tests in our desktop-GL piglit list, a complete glmark2 run
 expected), a one-hour Hyprland soak with 676,080 GPU jobs, and
 1,000 fresh GL processes in a row, all with no GPU errors or
 recoveries.
+
+**External display.** The front USB-C port drives a monitor through a USB-C to
+HDMI adapter (tested: 2560x1440 at 60 Hz, plug, unplug and replug), as an
+optional feature that needs a small m1n1 change; see
+[display/README.md](display/README.md).
 
 **Known limits.** A GPU hang the firmware does not report needs a reboot
 (faults and the timeouts it reports recover). One GPU job runs at a time,
@@ -87,6 +97,7 @@ the laptop).
 |---|---|
 | [AGENTS.md](AGENTS.md) | Install guide, written for a coding agent |
 | [kernel/](kernel/README.md) | The kernel: base patches, the G15 driver patch, config, build script, driver loader |
+| [display/](display/README.md) | Optional external display on the front USB-C port: kernel patch (applied by the default build, inactive until enabled), m1n1 reservation patch, installer and rollback |
 | [docs/g15-spec/](docs/g15-spec/README.md) | How the G15 GPU is driven: memory map, firmware interface and submission, render and compute jobs, shaders, display, known limits. Written for developers who know the M1/M2 (G13/G14) Asahi driver |
 | [mesa/](mesa/README.md) | The Mesa G15 render patch, one diff against Gravity Mesa `87ac51d` |
 | [tools/gl-test/](tools/gl-test/README.md) | GLES test client with CPU-oracle and llvmpipe checks |
