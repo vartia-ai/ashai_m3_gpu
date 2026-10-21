@@ -1,0 +1,16 @@
+diff --git a/tools/include/linux/types.h b/tools/include/linux/types.h
+index d41f8a261..c20eca11c 100644
+--- a/tools/include/linux/types.h
++++ b/tools/include/linux/types.h
+@@ -13,6 +13,11 @@
+ #include <asm/types.h>
+ #include <asm/posix_types.h>
+ 
++/* linux-api-headers >= 7.3: the arm64 uapi ptrace.h and sigcontext.h use __u128. */
++#ifdef __SIZEOF_INT128__
++typedef unsigned __int128 __u128 __attribute__((aligned(16)));
++#endif
++
+ struct page;
+ struct kmem_cache;
+ 

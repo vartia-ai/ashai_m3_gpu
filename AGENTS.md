@@ -14,14 +14,16 @@ if any does not, stop and tell the person why (section 8).
 |---|---|---|
 | Machine | `tr -d '\0' < /proc/device-tree/compatible` | contains `apple,j613` (MacBook Air 13", M3) |
 | Linux already runs | | The person boots Linux on this Mac today (Asahi-style install: m1n1, U-Boot, GRUB), with working storage, network and display |
-| Stub firmware | `tr -d '\0' < /proc/device-tree/chosen/asahi,os-fw-version` | `14.7` |
+| Stub firmware | `tr -d '\0' < /proc/device-tree/chosen/asahi,os-fw-version` | `14.7` (the Asahi installer's macOS 14.8.3 stub reports 14.7) |
 | GPU firmware loader | `tr -d '\0' < /proc/device-tree/chosen/asahi,iboot2-version` | `iBoot-10151.140.19.700.2` |
 | Architecture | `uname -m` | `aarch64` |
 | Free space | `df -h ~ /boot` | ~12 GB for the kernel build, a few GB for Mesa, ~100 MB in `/boot` |
 
 The firmware values describe the macOS system firmware of the Linux install
 (the stub macOS the Asahi installer created), not the macOS the person uses.
-They cannot be changed from Linux.
+They cannot be changed from Linux. The Asahi installer gives every M3 a macOS
+14.8.3 stub (its log says "Using macOS 14.8.3 for OS firmware"); its GPU and
+display firmware report 14.7, which is what this release supports.
 
 The driver itself refuses to start when the machine or firmware differ, so
 a mismatch cannot damage anything; it just will not work.
@@ -43,7 +45,9 @@ a mismatch cannot damage anything; it just will not work.
   or the overlay to "fit" another machine or firmware. Section 8 explains
   what other configurations need.
 - **One driver load per boot.** The GPU firmware cannot be reset, so the
-  driver cannot be unloaded or reloaded. To retry, reboot.
+  driver cannot be unloaded or reloaded. To retry, reboot. With the desktop
+  set up (section 6), `g15-load.service` loads it at boot; do not run
+  `g15-load` again by hand.
 - **Expect hangs.** This is early work (see the README). A GPU hang the
   firmware does not report freezes graphics until a reboot. Make sure the
   person has saved their work before testing.
@@ -59,58 +63,18 @@ The script fetches AsahiLinux/linux at the tested commit, applies the
 patches, and stops if the source differs from what was tested. Build
 dependencies (Arch Linux ARM names): `base-devel bc cpio pahole rust
 rust-bindgen rust-src clang llvm`. The config expects recent toolchains
-(tested: gcc 16.1.1, rustc 1.98.1, bindgen 0.73.2); if `olddefconfig` reports
-a config change, tell the person, but the build can continue.
+(tested: gcc 16.1.1, rustc 1.98.1, bindgen 0.73.2, linux-api-headers 7.3); if
+`olddefconfig` reports a config change, tell the person, but the build can
+continue. The kernel's Rust code is tied to the compiler release: if the
+installed rustc is newer than the tested one and the build fails, report it
+and do not edit the source. To keep a working toolchain across updates, the
+person can hold it with `IgnorePkg = rust rust-src` in `/etc/pacman.conf`.
 
-## 4. Install the kernel next to the existing one
+The kernel and Mesa builds (sections 3 and 4) need no driver and run on the
+person's current kernel. Do both before the first boot of the G15 kernel, so
+that boot can already run the desktop on the GPU.
 
-Release name: `7.2.2-display-driver-g15` (print it with
-`make -s -C ~/g15-kernel/linux O=~/g15-kernel/build LOCALVERSION= kernelrelease`).
-
-```
-sudo make -C ~/g15-kernel/linux O=~/g15-kernel/build LOCALVERSION= modules_install
-sudo mkdir /boot/g15
-sudo cp ~/g15-kernel/build/arch/arm64/boot/Image /boot/g15/Image
-sudo mkinitcpio -k 7.2.2-display-driver-g15 -g /boot/g15/initramfs.img
-sudo install -m 644 ~/g15/kernel/modprobe-g15.conf /etc/modprobe.d/g15.conf
-sudo install -m 755 ~/g15/kernel/g15-load /usr/local/sbin/g15-load
-```
-
-Use the initramfs tool the system already uses (`mkinitcpio` on Arch Linux
-ARM; `dracut` elsewhere). If `/lib/modules/7.2.2-display-driver-g15` already
-exists, stop and ask: something else installed that release.
-
-Then add a GRUB entry: copy the person's current Linux menu entry (find it
-in `/boot/grub/grub.cfg` or the file their setup uses for custom entries,
-such as `/boot/grub/custom.cfg` or `/etc/grub.d/40_custom`). Change only the
-title, `--id g15`, the `linux` path to `/g15/Image` (keep every kernel
-argument as is), and the `initrd` path to `/g15/initramfs.img`. Paths are
-relative to the partition GRUB searches, as in the copied entry. Regenerate
-`grub.cfg` the way the system does it (`grub-mkconfig -o /boot/grub/grub.cfg`)
-if the entry lives in `/etc/grub.d`. Show the person the new entry (with
-secrets redacted) before you write it.
-
-## 5. Boot it once and load the driver
-
-Boot the new entry for one boot only, so the next reboot returns to the
-known-good kernel:
-
-```
-sudo grub-reboot g15 && sudo reboot
-```
-
-After the reboot, check that `uname -r` is `7.2.2-display-driver-g15`, that
-the display, keyboard and network work, then:
-
-```
-sudo g15-load
-```
-
-Success prints `crashed=0`, `submissions=0` and `G15 driver loaded`. If
-`modprobe g15_dt_overlay` fails with "No such device", one of the checks in
-section 1 failed: `sudo dmesg | grep g15_dt_overlay` says which.
-
-## 6. Build Mesa and test rendering
+## 4. Build Mesa
 
 Install Mesa's build dependencies first. These steps were run end to end on
 the project's laptop (up-to-date Omarchy, LLVM 23), where the first six
@@ -141,7 +105,86 @@ cat > ~/g15-mesa/50_g15_mesa.json <<EOF
 EOF
 ```
 
-Test with the client in `tools/gl-test` (needs the driver loaded):
+## 5. Install the kernel next to the existing one
+
+Release name: `7.2.2-display-driver-g15` (print it with
+`make -s -C ~/g15-kernel/linux O=~/g15-kernel/build LOCALVERSION= kernelrelease`).
+
+```
+sudo make -C ~/g15-kernel/linux O=~/g15-kernel/build LOCALVERSION= modules_install
+sudo mkdir /boot/g15
+sudo cp ~/g15-kernel/build/arch/arm64/boot/Image /boot/g15/Image
+sudo mkinitcpio -k 7.2.2-display-driver-g15 -g /boot/g15/initramfs.img
+sudo install -m 644 ~/g15/kernel/modprobe-g15.conf /etc/modprobe.d/g15.conf
+sudo install -m 755 ~/g15/kernel/g15-load /usr/local/sbin/g15-load
+```
+
+Use the initramfs tool the system already uses (`mkinitcpio` on Arch Linux
+ARM; `dracut` elsewhere). If `/lib/modules/7.2.2-display-driver-g15` already
+exists, stop and ask: something else installed that release.
+
+Then add a GRUB entry: copy the person's current Linux menu entry (find it
+in `/boot/grub/grub.cfg` or the file their setup uses for custom entries,
+such as `/boot/grub/custom.cfg` or `/etc/grub.d/40_custom`). Change only the
+title, `--id g15`, the `linux` path to `/g15/Image` (keep every kernel
+argument as is), and the `initrd` path to `/g15/initramfs.img`. Paths are
+relative to the partition GRUB searches, as in the copied entry. GRUB reads
+`/boot/grub/custom.cfg` at boot, so an entry added there needs no regeneration.
+Regenerate `grub.cfg` the way the system does it (`grub-mkconfig -o
+/boot/grub/grub.cfg`) only if the entry lives in `/etc/grub.d`, and not if the
+person's `grub.cfg` was edited by hand (regeneration would drop those edits).
+Show the person the new entry (with secrets redacted) before you write it.
+
+## 6. Set up the desktop session
+
+So that the first boot of the G15 kernel runs the Omarchy (Hyprland) desktop
+on the GPU, install the session pieces now, as the person (not root):
+
+```
+~/g15/tools/desktop/install.sh
+```
+
+It installs and enables `g15-load.service` (loads the driver at boot, before
+the login screen, on the G15 kernel only), the session hook that points
+Hyprland and its apps at `~/g15-mesa`, and wrappers for apps that need
+features the driver does not have yet (Omarchy's shell, Ghostty). It keeps a
+`.bak-<date>` copy of any file it replaces; show the person what it replaced.
+Everything is inactive on other kernels. The login screen stays on the CPU
+renderer (Omarchy's SDDM configuration already does this; the script warns
+if it does not). See `tools/desktop/README.md`.
+
+If the person skips this, the G15 kernel boots to the CPU-rendered desktop
+and the driver is loaded by hand (section 7).
+
+**Optional: external display.** The front USB-C port can drive a monitor
+([display/README.md](display/README.md)). It needs an m1n1 change and is set
+up only when the person asks for it; do it now, before section 7, following
+that guide.
+
+## 7. Boot it once and check
+
+Have the person save their work. Boot the new entry for one boot only, so the
+next reboot returns to the known-good kernel:
+
+```
+sudo grub-reboot g15 && sudo reboot
+```
+
+After the reboot, check that `uname -r` is `7.2.2-display-driver-g15` and
+that the display, keyboard and network work. With section 6 done, the
+driver is already loaded and the desktop is on the GPU:
+
+```
+systemctl status g15-load.service
+```
+
+It must be active with `G15 driver loaded` in its log. Without section 6,
+load it by hand: `sudo g15-load`. Either way, success shows `crashed=0`,
+`submissions=0` and `G15 driver loaded`. If `modprobe g15_dt_overlay` fails
+with "No such device", one of the checks in section 1 failed:
+`sudo dmesg | grep g15_dt_overlay` says which.
+
+Then test rendering with the client in `tools/gl-test`:
 
 ```
 cd ~/g15/tools/gl-test && make
@@ -152,17 +195,10 @@ ASAHI_G15_GRAPHICS=1 LD_LIBRARY_PATH=$HOME/g15-mesa/lib \
 
 It must print `G15_GL_RESULT PASS mismatches=0 ...`. Then
 `sudo cat /sys/kernel/debug/asahi/g15_accounting` should show
-`completion_errors=0` and `recoveries=0`.
-
-## 7. Optional: a desktop session on the GPU
-
-`tools/desktop/README.md` describes running Hyprland (Omarchy) on the G15
-GPU: a session hook that loads the driver at login and points the compositor
-and apps at `~/g15-mesa`, plus wrappers for apps that need features the
-driver does not have yet. Keep the login screen on the CPU renderer as
-described there. Logging out and back in works; apps that need more than
-GLES 3.0 or desktop GL 2.1 (Chromium's GPU path, Ghostty) run on the CPU
-renderer.
+`completion_errors=0` and `recoveries=0`; with the desktop running,
+`submissions` keeps rising. Logging out and back in works; apps that need
+more than GLES 3.0 or desktop GL 2.1 (Chromium's GPU path, Ghostty) run on
+the CPU renderer.
 
 ## 8. When it does not apply, and how to undo it
 
@@ -177,8 +213,11 @@ changing values.
 
 **Undo.** Reboot (the one-time boot returns to the old kernel), then remove
 the GRUB entry, `/boot/g15`, `/lib/modules/7.2.2-display-driver-g15`,
-`/etc/modprobe.d/g15.conf`, `/usr/local/sbin/g15-load`, `~/g15-mesa` and any
-desktop hooks from section 7.
+`/etc/modprobe.d/g15.conf`, `/usr/local/sbin/g15-load`, `~/g15-mesa`, and
+the section 6 pieces: `sudo systemctl disable g15-load.service`, then remove
+`/etc/systemd/system/g15-load.service`, `~/.config/uwsm/env-hyprland` and the
+wrappers listed in `tools/desktop/README.md` (restoring any `.bak-<date>`
+copies). The external display has its own rollback in `display/README.md`.
 
 **Making it the default** is the person's decision, once the G15 kernel has
 worked for them. Only then set GRUB's default to the `g15` entry.
