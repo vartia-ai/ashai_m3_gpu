@@ -84,10 +84,20 @@ for this configuration; see [kernel/README.md](kernel/README.md).
 
 ## Installing
 
-Clone this repository on the laptop and have a coding agent (Claude Code,
-Codex or similar) follow [AGENTS.md](AGENTS.md); it is also readable as a
-manual guide. It checks the machine, builds the kernel and Mesa from source
-on the laptop, adds the kernel as a **one-time, non-default** boot entry
+Open a coding agent (Claude Code, Codex or similar) in a terminal on the
+laptop and paste:
+
+> Install the G15 GPU driver from https://github.com/vartia-ai/m3_gpu on this
+> MacBook Air M3. Clone it to ~/g15 and follow its AGENTS.md.
+
+The agent checks the machine first and stops if this release does not support
+it. It asks you to run each step that needs root (one or two `sudo`
+commands), then you reboot once into the new entry.
+
+The guide, [AGENTS.md](AGENTS.md), also works for doing it by hand. It checks
+the machine, builds the kernel and Mesa from source on the laptop (a Rust
+compiler newer than the tested one is handled with a user-only rustup
+toolchain), adds the kernel as a **one-time, non-default** boot entry
 next to your existing one, and sets up the desktop session, so the first
 boot of the new kernel already runs Omarchy (Hyprland) on the GPU. It then
 runs a rendering test. Your existing boot entry, m1n1, macOS and disk

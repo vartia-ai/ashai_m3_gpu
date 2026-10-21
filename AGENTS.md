@@ -98,10 +98,31 @@ dependencies (Arch Linux ARM names): `base-devel bc cpio pahole rust
 rust-bindgen rust-src clang llvm`. The config expects recent toolchains
 (tested: gcc 16.1.1, rustc 1.98.1, bindgen 0.73.2, linux-api-headers 7.3); if
 `olddefconfig` reports a config change, tell the person, but the build can
-continue. The kernel's Rust code is tied to the compiler release: if the
-installed rustc is newer than the tested one and the build fails, report it
-and do not edit the source. To keep a working toolchain across updates, the
-person can hold it with `IgnorePkg = rust rust-src` in `/etc/pacman.conf`.
+continue.
+
+**Rust version.** The kernel's Rust code is tied to the compiler release. If
+`rustc --version` is not 1.98.1, build with the tested release from rustup,
+for the person's user and this build only. Don't install the `rustup` package,
+because it replaces `rust`. Use the standalone installer without changing their
+PATH. If rustup is already in `~/.cargo/bin` (for example from the m1n1 build),
+skip the first command:
+
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+~/.cargo/bin/rustup toolchain install 1.98.1 --profile minimal --component rust-src
+PATH=$HOME/.rustup/toolchains/1.98.1-aarch64-unknown-linux-gnu/bin:$PATH ~/g15/install.sh build
+```
+
+The same `PATH=...` prefix works in front of `kernel/build.sh`. The kernel
+then takes rustc and the Rust library source from that toolchain, and bindgen
+from the system. Mesa does not use Rust. With this toolchain, `olddefconfig`
+reports a config change. That is expected: only `CONFIG_RUSTC_VERSION_TEXT`
+differs, because it lacks Arch's "(Arch Linux rust ...)" suffix. If you are resuming a build that
+started with another rustc, use a new WORKDIR. Don't edit the source to fit
+another compiler. If the build fails with the tested release as well, report
+it. Alternatively, the person can keep the system compiler at the tested
+release with `IgnorePkg = rust rust-src` in `/etc/pacman.conf`.
 
 The kernel and Mesa builds (sections 3 and 4) need no driver and run on the
 person's current kernel. Do both before the first boot of the G15 kernel, so
